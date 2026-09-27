@@ -2,6 +2,7 @@
 /target
 
 # game data and anything derived from it - never committed
+/externals
 /data
 /out
 *.nds
