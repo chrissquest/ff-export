@@ -21,6 +21,7 @@ use std::mem;
 use anyhow::{Result, bail};
 use gltf::json::{self, Index, validation::Checked::Valid, validation::USize64};
 
+use crate::anim;
 use crate::gpu::Geometry;
 use crate::mesh::Mesh;
 
@@ -278,11 +279,38 @@ fn position_bounds(positions: &[[f32; 3]]) -> (json::Value, json::Value) {
     )
 }
 
-/// Builds a `.glb` holding the creature's bind-pose mesh and its skeleton.
+/// One clip to embed: the name to give the glTF animation, and its decoded keyframes.
+pub struct Clip<'a> {
+    pub name: &'a str,
+    pub animation: &'a anim::Animation,
+}
+
+/// Where a clip's sample data landed in the binary buffer.
+struct ClipChunks {
+    times: Chunk,
+    frames: usize,
+    /// Per bone: translation, rotation and scale sample ranges.
+    bones: Vec<(Chunk, Chunk, Chunk)>,
+}
+
+fn bytes_f32(values: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+/// Builds a `.glb` holding the creature's bind-pose mesh, its skeleton, and any clips given.
 ///
 /// Returns the file bytes and the split that produced them, so the caller can report what was
 /// written without doing the work twice.
-pub fn build(decoded: &Mesh, geometry: &Geometry, name: &str) -> Result<(Vec<u8>, Split)> {
+pub fn build(
+    decoded: &Mesh,
+    geometry: &Geometry,
+    name: &str,
+    clips: &[Clip<'_>],
+) -> Result<(Vec<u8>, Split)> {
     let split = split(geometry);
 
     if decoded.bones.is_empty() {
@@ -320,6 +348,68 @@ pub fn build(decoded: &Mesh, geometry: &Geometry, name: &str) -> Result<(Vec<u8>
         .iter()
         .map(|indices| push_bytes(&mut bin, &bytes_u32(indices)))
         .collect();
+
+    // Per clip: one shared time array, then translation/rotation/scale samples per bone. Every
+    // frame's matrix is decomposed, because glTF animates TRS and has no matrix channels.
+    let mut clip_chunks: Vec<ClipChunks> = Vec::with_capacity(clips.len());
+    for clip in clips {
+        if clip.animation.bone_count != decoded.bones.len() {
+            bail!(
+                "clip `{}` animates {} bones but the mesh has {}",
+                clip.name,
+                clip.animation.bone_count,
+                decoded.bones.len()
+            );
+        }
+
+        let frames = clip.animation.frame_count;
+        let times_chunk = push_bytes(&mut bin, &bytes_f32(&clip.animation.times()));
+
+        let mut bones = Vec::with_capacity(clip.animation.bone_count);
+        for bone in 0..clip.animation.bone_count {
+            let mut translations = Vec::with_capacity(frames);
+            let mut rotations = Vec::with_capacity(frames);
+            let mut scales = Vec::with_capacity(frames);
+
+            for frame in 0..frames {
+                let matrix = clip
+                    .animation
+                    .transform(bone, frame)
+                    .expect("the frame is within range");
+                let pose = matrix.decompose();
+
+                translations.push([
+                    pose.translation[0] as f32,
+                    pose.translation[1] as f32,
+                    pose.translation[2] as f32,
+                ]);
+                rotations.push([
+                    pose.rotation[0] as f32,
+                    pose.rotation[1] as f32,
+                    pose.rotation[2] as f32,
+                    pose.rotation[3] as f32,
+                ]);
+                scales.push([
+                    pose.scale[0] as f32,
+                    pose.scale[1] as f32,
+                    pose.scale[2] as f32,
+                ]);
+            }
+
+            bones.push((
+                push_bytes(&mut bin, &bytes_f32x3(&translations)),
+                push_bytes(&mut bin, &bytes_f32x4(&rotations)),
+                push_bytes(&mut bin, &bytes_f32x3(&scales)),
+            ));
+        }
+
+        clip_chunks.push(ClipChunks {
+            times: times_chunk,
+            frames,
+            bones,
+        });
+    }
+
     while bin.len() % 4 != 0 {
         bin.push(0);
     }
@@ -459,6 +549,89 @@ pub fn build(decoded: &Mesh, geometry: &Geometry, name: &str) -> Result<(Vec<u8>
             })
         })
         .collect();
+
+    // One glTF animation per clip: a sampler and a channel for each of a bone's three paths. Every
+    // sampler in a clip shares the same time accessor.
+    for (clip, chunks) in clips.iter().zip(&clip_chunks) {
+        let last_time = if chunks.frames > 1 {
+            (chunks.frames - 1) as f32 / 60.0
+        } else {
+            0.0
+        };
+        let input = accessor(
+            &mut root,
+            buffer,
+            chunks.times,
+            chunks.frames,
+            json::accessor::ComponentType::F32,
+            json::accessor::Type::Scalar,
+            Some((json::Value::from(0.0), json::Value::from(last_time))),
+        );
+
+        let mut samplers = Vec::new();
+        let mut channels = Vec::new();
+
+        for (bone, (translation, rotation, scale)) in chunks.bones.iter().enumerate() {
+            let node = joint_nodes[bone];
+            let paths = [
+                (
+                    json::animation::Property::Translation,
+                    *translation,
+                    json::accessor::Type::Vec3,
+                ),
+                (
+                    json::animation::Property::Rotation,
+                    *rotation,
+                    json::accessor::Type::Vec4,
+                ),
+                (
+                    json::animation::Property::Scale,
+                    *scale,
+                    json::accessor::Type::Vec3,
+                ),
+            ];
+
+            for (property, chunk, kind) in paths {
+                let output = accessor(
+                    &mut root,
+                    buffer,
+                    chunk,
+                    chunks.frames,
+                    json::accessor::ComponentType::F32,
+                    kind,
+                    None,
+                );
+
+                samplers.push(json::animation::Sampler {
+                    extensions: Default::default(),
+                    extras: Default::default(),
+                    input,
+                    interpolation: Valid(json::animation::Interpolation::Linear),
+                    output,
+                });
+
+                channels.push(json::animation::Channel {
+                    extensions: Default::default(),
+                    extras: Default::default(),
+                    sampler: Index::new((samplers.len() - 1) as u32),
+                    target: json::animation::Target {
+                        extensions: Default::default(),
+                        extras: Default::default(),
+                        node,
+                        path: Valid(property),
+                    },
+                });
+            }
+        }
+
+        root.push(json::Animation {
+            channels,
+            extensions: Default::default(),
+            extras: Default::default(),
+            name: Some(clip.name.to_string()),
+            samplers,
+        });
+    }
 
     let skin = root.push(json::Skin {
         inverse_bind_matrices: Some(inverse_bind_accessor),

@@ -320,7 +320,7 @@ fn m3_exported_glb_reads_back() {
     let Some(rom) = rom() else { return };
     let archive = arcdin(&rom);
     let (decoded, geometry) = decode(&archive, 384);
-    let (bytes, split) = gltf_out::build(&decoded, &geometry, "Breme").expect("the glb should build");
+    let (bytes, split) = gltf_out::build(&decoded, &geometry, "Breme", &[]).expect("the glb should build");
 
     // The crate's own reader has to accept what we wrote - that is the spec check.
     let (document, buffers, _images) =
@@ -395,7 +395,7 @@ fn m3_every_creature_exports_a_glb() {
         let (decoded, geometry) = decode(&archive, clip.mesh.index);
         let name = format!("vivosaur_{:03}", creature.id);
 
-        let (bytes, split) = gltf_out::build(&decoded, &geometry, &name)
+        let (bytes, split) = gltf_out::build(&decoded, &geometry, &name, &[])
             .unwrap_or_else(|error| panic!("creature {} clip {}: {error:#}", creature.id, clip.slot));
 
         assert_eq!(&bytes[0..4], b"glTF", "creature {} magic", creature.id);
@@ -481,5 +481,81 @@ fn m4_frame_zero_is_the_bind_pose() {
                 bind.translation[axis]
             );
         }
+    }
+}
+
+#[test]
+fn m4_all_of_a_creatures_clips_land_in_one_glb() {
+    let Some(rom) = rom() else { return };
+    let archive = arcdin(&rom);
+    let parsed = manifest::parse(&archive.decompressed(0).unwrap()).unwrap();
+    let breme = parsed.find(30).expect("Breme");
+
+    let (decoded, geometry) = decode(&archive, breme.clips[0].mesh.index);
+
+    let mut animations = Vec::new();
+    for clip in &breme.clips {
+        animations.push(
+            anim::parse(&archive.decompressed(clip.animation.index as usize).unwrap())
+                .unwrap_or_else(|error| panic!("clip {}: {error:#}", clip.slot)),
+        );
+    }
+
+    let names: Vec<String> = breme
+        .clips
+        .iter()
+        .map(|clip| manifest::clip_label(clip.slot).to_string())
+        .collect();
+    let clips: Vec<gltf_out::Clip<'_>> = names
+        .iter()
+        .zip(&animations)
+        .map(|(name, animation)| gltf_out::Clip {
+            name: name.as_str(),
+            animation,
+        })
+        .collect();
+
+    let (bytes, _split) =
+        gltf_out::build(&decoded, &geometry, "Breme", &clips).expect("the glb should build");
+    let (document, buffers, _images) =
+        gltf::import_slice(&bytes).expect("the exported glb should import");
+
+    let found: Vec<_> = document.animations().collect();
+    assert_eq!(found.len(), 6, "Breme has six clips");
+
+    // names and frame counts, in slot order
+    let expected = [
+        ("attack", 257usize),
+        ("roar", 90),
+        ("victory", 200),
+        ("hit", 80),
+        ("critical-hit", 80),
+        ("idle", 60),
+    ];
+
+    for (animation, (name, frames)) in found.iter().zip(expected) {
+        assert_eq!(animation.name(), Some(name), "clip name");
+
+        let mut channels = 0usize;
+        let mut samples = 0usize;
+        for channel in animation.channels() {
+            channels += 1;
+            let reader = channel.reader(|buffer| Some(&buffers[buffer.index()]));
+            let times: Vec<f32> = reader.read_inputs().expect("sample times").collect();
+            samples = samples.max(times.len());
+
+            assert!(
+                times[0].abs() < 1e-6,
+                "clip `{name}` should start at 0 seconds"
+            );
+            assert!(
+                (times[1] - 1.0 / 60.0).abs() < 1e-6,
+                "clip `{name}` should step by 1/60 s, got {}",
+                times[1]
+            );
+        }
+
+        assert_eq!(channels, 21 * 3, "clip `{name}`: three channels per bone");
+        assert_eq!(samples, frames, "clip `{name}` sample count");
     }
 }

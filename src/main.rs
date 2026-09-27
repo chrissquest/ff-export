@@ -25,7 +25,7 @@ COMMANDS:
     names   <rom> [all]                 the 116 creature id -> name pairs
     mesh    <rom> <creature> [clip]     parse one creature mesh and report its geometry
     obj     <rom> <creature> [clip] <file.obj>   write the decoded mesh as Wavefront OBJ
-    export  <rom> <creature> [clip] <file.glb>   write the bind-pose mesh and skeleton as .glb
+    export  <rom> <creature> [clip] <file.glb>   write mesh, skeleton and clips as .glb (all clips unless one is given)
     anim    <rom> <creature> <clip>              inspect one clip's animation block
     hexdump <rom> <path> <entry> [len]  raw stored bytes of one entry, for analysis
     help                                show this text
@@ -639,16 +639,25 @@ fn cmd_export(args: &[String]) -> Result<()> {
         .and_then(|all| all.get(creature_id - 1).cloned())
         .unwrap_or_else(|| format!("vivosaur_{creature_id:03}"));
 
-    let clip = match clip_slot {
-        Some(slot) => creature
-            .clips
-            .iter()
-            .find(|clip| clip.slot == slot)
-            .with_context(|| format!("creature {creature_id} has no clip slot {slot}"))?,
-        None => &creature.clips[0],
+    // All of a creature's clips by default, or just the one asked for
+    let wanted: Vec<&manifest::Clip> = match clip_slot {
+        Some(slot) => vec![
+            creature
+                .clips
+                .iter()
+                .find(|clip| clip.slot == slot)
+                .with_context(|| format!("creature {creature_id} has no clip slot {slot}"))?,
+        ],
+        None => creature.clips.iter().collect(),
     };
 
-    let decoded = mesh::parse(&archive.decompressed(clip.mesh.index as usize)?)?;
+    // The mesh comes from the creature's first clip. A sweep test decodes every clip of every
+    // creature, so the clips demonstrably share one mesh.
+    let mesh_clip = creature
+        .clips
+        .first()
+        .with_context(|| format!("creature {creature_id} has no clips"))?;
+    let decoded = mesh::parse(&archive.decompressed(mesh_clip.mesh.index as usize)?)?;
     let stream = gpu::parse_stream(&decoded.commands)?;
     let geometry = gpu::build_geometry(
         &decoded,
@@ -656,12 +665,40 @@ fn cmd_export(args: &[String]) -> Result<()> {
         stream.gpu_commands()?,
     )?;
 
-    let (bytes, split) = gltf_out::build(&decoded, &geometry, &name)?;
+    let mut animations = Vec::with_capacity(wanted.len());
+    for clip in &wanted {
+        animations.push(anim::parse(
+            &archive.decompressed(clip.animation.index as usize)?,
+        )?);
+    }
+
+    // slot 2 is the one clip nobody has identified, so it gets a positional name
+    let names: Vec<String> = wanted
+        .iter()
+        .map(|clip| {
+            let label = manifest::clip_label(clip.slot);
+            if label == "unknown" || label == "unused" {
+                format!("clip-{}", clip.slot)
+            } else {
+                label.to_string()
+            }
+        })
+        .collect();
+
+    let clips: Vec<gltf_out::Clip<'_>> = names
+        .iter()
+        .zip(&animations)
+        .map(|(name, animation)| gltf_out::Clip {
+            name: name.as_str(),
+            animation,
+        })
+        .collect();
+
+    let (bytes, split) = gltf_out::build(&decoded, &geometry, &name, &clips)?;
     std::fs::write(&output, &bytes).with_context(|| format!("writing {}", output.display()))?;
 
     let triangles: usize = split.groups.iter().map(Vec::len).sum::<usize>() / 3;
     println!("creature     : {creature_id} {name}");
-    println!("clip         : {} ({})", clip.slot, manifest::clip_label(clip.slot));
     println!(
         "vertices     : {} after UV splitting ({} before)",
         split.positions.len(),
@@ -678,6 +715,15 @@ fn cmd_export(args: &[String]) -> Result<()> {
             "kept, already facing outwards"
         }
     );
+    println!("clips        : {}", clips.len());
+    for (clip, animation) in wanted.iter().zip(&animations) {
+        println!(
+            "  {:<14} {} frames  {:.3}s",
+            manifest::clip_label(clip.slot),
+            animation.frame_count,
+            animation.frame_count as f64 / 60.0
+        );
+    }
     println!("wrote        : {} bytes to {}", bytes.len(), output.display());
 
     Ok(())

@@ -13,7 +13,7 @@ Early work in progress. The container and compression layers work; no glTF is wr
 | M1 | MAR archives, MCM chunk wrapper, LZ10, Huffman | done |
 | M2 | `3CL` manifest → creature → mesh / animation / texture, plus creature names | done |
 | M3 | mesh + skeleton → static `.glb` | done — verified against the reference numbers and re-read with the glTF crate's importer, for every creature |
-| M4 | animation clips in the `.glb` | in progress — the animation block is decoded and verified against the reference (frame counts, and frame 0 equals the bind pose); writing the glTF animation channels is next |
+| M4 | animation clips in the `.glb` | done — all of a creature's clips land in one file as named glTF animations |
 | M5 | textures → PNG, embedded | not started |
 | M6 | all clips merged per creature + `manifest.json` | not started |
 
