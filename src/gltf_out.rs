@@ -18,7 +18,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::mem;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use gltf::json::{self, Index, validation::Checked::Valid, validation::USize64};
 
 use crate::anim;
@@ -225,6 +225,11 @@ fn bytes_u32(values: &[u32]) -> Vec<u8> {
     out
 }
 
+/// Encodes RGBA8 pixels as a PNG, which is what glTF embeds.
+fn encode_png(image: &ImageSource<'_>) -> Result<Vec<u8>> {
+    crate::texture::encode_png(image.width, image.height, image.pixels)
+}
+
 /// Creates a buffer view plus an accessor over one byte range.
 #[allow(clippy::too_many_arguments)]
 fn accessor(
@@ -296,6 +301,25 @@ pub struct Clip<'a> {
     pub animation: &'a anim::Animation,
 }
 
+/// One image to embed, already decoded to RGBA8.
+pub struct ImageSource<'a> {
+    pub width: u32,
+    pub height: u32,
+    /// RGBA8, row by row.
+    pub pixels: &'a [u8],
+    /// Whether alpha should be honoured. A DS texture marks its colour-keyed background transparent,
+    /// and glTF would draw it as a solid colour unless the material masks it out.
+    pub alpha_mask: bool,
+}
+
+/// One material to write, in the same order as `geometry.groups`.
+pub struct MaterialSource<'a> {
+    /// The material's name, e.g. `din030_a`.
+    pub name: &'a str,
+    /// The base colour texture, if the group's palette base named an image.
+    pub image: Option<ImageSource<'a>>,
+}
+
 /// Where a clip's sample data landed in the binary buffer.
 struct ClipChunks {
     times: Chunk,
@@ -329,6 +353,7 @@ pub fn build(
     geometry: &Geometry,
     name: &str,
     clips: &[Clip<'_>],
+    material_sources: &[MaterialSource<'_>],
 ) -> Result<(Vec<u8>, Split)> {
     let split = split(geometry);
 
@@ -423,6 +448,19 @@ pub fn build(
         });
     }
 
+    // Textures share the buffer with the geometry, so they have to be placed before the buffer is
+    // described.
+    let mut image_chunks: Vec<Option<Chunk>> = Vec::with_capacity(material_sources.len());
+    for source in material_sources {
+        match source.image.as_ref() {
+            Some(image) => {
+                let png = encode_png(image).with_context(|| format!("texture `{}`", source.name))?;
+                image_chunks.push(Some(push_bytes(&mut bin, &png)));
+            }
+            None => image_chunks.push(None),
+        }
+    }
+
     while bin.len() % 4 != 0 {
         bin.push(0);
     }
@@ -499,15 +537,97 @@ pub fn build(
     );
     // --- primitives, nodes, skin and scene ---
 
-    // one primitive and one placeholder material per group; M5 supplies the textures
-    let mut materials = Vec::new();
-    for group in &geometry.groups {
-        let key = match group.palette_base {
-            Some(value) => value.to_string(),
-            None => "none".to_string(),
+    // One material per group. A group whose palette base named an image gets that image as its base
+    // colour; a group that named nothing visible keeps a placeholder so the geometry stays complete.
+    let mut sampler: Option<Index<json::texture::Sampler>> = None;
+    let mut materials: Vec<Index<json::Material>> = Vec::with_capacity(geometry.groups.len());
+    for (index, group) in geometry.groups.iter().enumerate() {
+        let source = material_sources.get(index);
+        let name = match source {
+            Some(source) => source.name.to_string(),
+            None => match group.palette_base {
+                Some(value) => format!("material_{value}"),
+                None => "material_none".to_string(),
+            },
         };
+
+        let mut base_color_texture = None;
+        let mut alpha_mask = false;
+        if let Some(chunk) = image_chunks.get(index).copied().flatten() {
+            alpha_mask = source
+                .and_then(|source| source.image.as_ref())
+                .is_some_and(|image| image.alpha_mask);
+
+            let view = root.push(json::buffer::View {
+                buffer,
+                byte_length: USize64::from(chunk.length),
+                byte_offset: Some(USize64::from(chunk.offset)),
+                byte_stride: None,
+                extensions: Default::default(),
+                extras: Default::default(),
+                name: None,
+                // an image is not vertex data, so it declares no target
+                target: None,
+            });
+            let image = root.push(json::Image {
+                buffer_view: Some(view),
+                mime_type: Some(json::image::MimeType("image/png".to_string())),
+                uri: None,
+                name: Some(name.clone()),
+                extensions: Default::default(),
+                extras: Default::default(),
+            });
+            let sampler = match sampler {
+                Some(existing) => existing,
+                None => {
+                    let created = root.push(json::texture::Sampler {
+                        // The DS GPU has no bilinear filtering: both its mag and min filters are
+                        // point samples, so nearest is the faithful choice, and the art is drawn to
+                        // rely on it.
+                        mag_filter: Some(Valid(json::texture::MagFilter::Nearest)),
+                        min_filter: Some(Valid(json::texture::MinFilter::Nearest)),
+                        wrap_s: Valid(json::texture::WrappingMode::Repeat),
+                        wrap_t: Valid(json::texture::WrappingMode::Repeat),
+                        name: Some("texture_sampler".to_string()),
+                        extensions: Default::default(),
+                        extras: Default::default(),
+                    });
+                    sampler = Some(created);
+                    created
+                }
+            };
+            let texture = root.push(json::Texture {
+                sampler: Some(sampler),
+                source: image,
+                name: Some(name.clone()),
+                extensions: Default::default(),
+                extras: Default::default(),
+            });
+            base_color_texture = Some(json::texture::Info {
+                index: texture,
+                tex_coord: 0,
+                extensions: Default::default(),
+                extras: Default::default(),
+            });
+        }
+
         materials.push(root.push(json::Material {
-            name: Some(format!("material_{key}")),
+            name: Some(name),
+            alpha_cutoff: alpha_mask.then_some(json::material::AlphaCutoff(0.5)),
+            alpha_mode: Valid(if alpha_mask {
+                json::material::AlphaMode::Mask
+            } else {
+                json::material::AlphaMode::Opaque
+            }),
+            pbr_metallic_roughness: json::material::PbrMetallicRoughness {
+                base_color_factor: json::material::PbrBaseColorFactor([1.0, 1.0, 1.0, 1.0]),
+                base_color_texture,
+                metallic_factor: json::material::StrengthFactor(0.0),
+                roughness_factor: json::material::StrengthFactor(1.0),
+                ..Default::default()
+            },
+            // the winding is corrected for the whole mesh, so faces are single sided
+            double_sided: false,
             ..Default::default()
         }));
     }

@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
-use ff_export::{anim, gltf_out, gpu, manifest, mar, mcm, mesh, names, nds};
+use ff_export::{anim, gltf_out, gpu, manifest, mar, mcm, mesh, names, nds, texture};
 
 const USAGE: &str = "\
 ff-export - Fossil Fighters (NDS) asset extraction
@@ -26,9 +26,16 @@ COMMANDS:
     mesh    <rom> <creature> [clip]     parse one creature mesh and report its geometry
     obj     <rom> <creature> [clip] <file.obj>   write the decoded mesh as Wavefront OBJ
     export  <rom> <creature> [clip] <file.glb>   write mesh, skeleton and clips as .glb (all clips unless one is given)
+    textures <rom> <creature> <outdir>           write a creature's texture images out as loose PNGs
     anim    <rom> <creature> <clip>              inspect one clip's animation block
     hexdump <rom> <path> <entry> [len]  raw stored bytes of one entry, for analysis
     help                                show this text
+
+FLAGS:
+    --uv-flip <none|v|u|swap>           texture coordinate orientation for `export` and `mesh`.
+                                        `none` is the default: the DS samples from the top-left with
+                                        V running down, exactly like glTF. The others exist to A/B
+                                        against the reference tool, which flips V for OBJ and USD.
 ";
 
 fn main() -> ExitCode {
@@ -45,6 +52,7 @@ fn main() -> ExitCode {
         Some("mesh") => cmd_mesh(&args[1..]),
         Some("obj") => cmd_obj(&args[1..]),
         Some("export") => cmd_export(&args[1..]),
+        Some("textures") => cmd_textures(&args[1..]),
         Some("anim") => cmd_anim(&args[1..]),
         Some("help") | None | Some("-h") | Some("--help") => {
             print!("{USAGE}");
@@ -67,6 +75,37 @@ fn arg(args: &[String], index: usize, name: &str) -> Result<String> {
         Some(value) => Ok(value.clone()),
         None => Err(anyhow::anyhow!("missing <{name}> argument\n\n{USAGE}")),
     }
+}
+
+/// Pulls `--uv-flip <mode>` (or `--uv-flip=<mode>`) out of the arguments, returning the rest.
+///
+/// Texture coordinate orientation is a diagnostic, not something every run needs, so it is a flag
+/// rather than a positional argument - and it has to be removed before the positional parsing counts.
+fn take_uv_flip(args: &[String]) -> Result<(Vec<String>, gpu::UvOrientation)> {
+    let mut rest = Vec::with_capacity(args.len());
+    let mut orientation = gpu::UvOrientation::Ds;
+    let mut index = 0;
+
+    while index < args.len() {
+        let argument = args[index].as_str();
+
+        let value = if let Some(value) = argument.strip_prefix("--uv-flip=") {
+            value.to_string()
+        } else if argument == "--uv-flip" {
+            index += 1;
+            args.get(index).context("--uv-flip needs a value")?.clone()
+        } else {
+            rest.push(args[index].clone());
+            index += 1;
+            continue;
+        };
+
+        orientation = gpu::UvOrientation::parse(&value)
+            .with_context(|| format!("--uv-flip must be none, v, u or swap, not `{value}`"))?;
+        index += 1;
+    }
+
+    Ok((rest, orientation))
 }
 
 fn is_mar(rom: &nds::Rom, file: &nds::RomFile) -> bool {
@@ -431,6 +470,9 @@ fn cmd_names(args: &[String]) -> Result<()> {
 
 /// Parses one creature's mesh and reports the geometry inside it.
 fn cmd_mesh(args: &[String]) -> Result<()> {
+    let (arguments, orientation) = take_uv_flip(args)?;
+    let args = arguments.as_slice();
+
     let rom_path = arg(args, 0, "rom")?;
     let creature_id: usize = arg(args, 1, "creature")?
         .parse()
@@ -484,11 +526,42 @@ fn cmd_mesh(args: &[String]) -> Result<()> {
 
     let stream = gpu::parse_stream(&parsed_mesh.commands)?;
     let world_root = stream.world_root_bone_count()?;
-    let geometry = gpu::build_geometry(&parsed_mesh, world_root, stream.gpu_commands()?)?;
+    let commands = stream.gpu_commands()?;
+    let mut geometry = gpu::build_geometry(&parsed_mesh, world_root, &commands)?;
+    if orientation != gpu::UvOrientation::Ds {
+        for uv in &mut geometry.uvs {
+            *uv = orientation.apply(*uv);
+        }
+    }
+
+    // What the stream asks of the matrix stack. A matrix in *texture* mode would transform every
+    // texture coordinate at once, and one in position mode would move every vertex, so it is worth
+    // showing - `matrixRestore` is not, since it runs once per bone. For this game every mesh issues
+    // one scale, an identity and two mode switches, and never loads a matrix, which `m3_no_mesh_loads_a_matrix`
+    // holds to across the roster.
+    let mut modes = Vec::new();
+    let mut scales = 0usize;
+    let mut loads = 0usize;
+    for command in commands {
+        match command {
+            gpu::Command::MatrixMode(mode) => modes.push(*mode),
+            gpu::Command::MatrixScale(_) => scales += 1,
+            gpu::Command::MatrixLoad4x3(_) => loads += 1,
+            _ => {}
+        }
+    }
+    println!("matrix cmds  : modes {modes:?}, {scales} scale, {loads} load4x3");
 
     println!();
     println!("vertices     : {}", geometry.positions.len());
     println!("uvs          : {}", geometry.uvs.len());
+    println!("uv flip      : {}", orientation.name());
+    if let Some((min, max)) = geometry.uv_bounds() {
+        println!(
+            "uv range     : u {:.4} .. {:.4}   v {:.4} .. {:.4}",
+            min[0], max[0], min[1], max[1]
+        );
+    }
     println!("faces        : {}", geometry.face_count());
     println!("triangles    : {}", geometry.triangle_count());
     println!("corners      : {}", geometry.corner_count());
@@ -572,8 +645,11 @@ fn cmd_obj(args: &[String]) -> Result<()> {
     for position in &geometry.positions {
         out.push_str(&format!("v {} {} {}\n", position[0], position[1], position[2]));
     }
+    // Wavefront OBJ's v axis runs upwards from a bottom-left origin, so writing our DS-space
+    // coordinates unflipped would put every texture upside down in an OBJ viewer. glTF needs no such
+    // flip (see `gpu::UvOrientation`), which is the whole reason this is done here and not up front.
     for uv in &geometry.uvs {
-        out.push_str(&format!("vt {} {}\n", uv[0], uv[1]));
+        out.push_str(&format!("vt {} {}\n", uv[0], 1.0 - uv[1]));
     }
 
     let mut triangles = 0usize;
@@ -614,6 +690,9 @@ fn cmd_obj(args: &[String]) -> Result<()> {
 
 /// Writes a creature clip's bind-pose mesh and skeleton as a `.glb`.
 fn cmd_export(args: &[String]) -> Result<()> {
+    let (arguments, orientation) = take_uv_flip(args)?;
+    let args = arguments.as_slice();
+
     let rom_path = arg(args, 0, "rom")?;
     let creature_id: usize = arg(args, 1, "creature")?
         .parse()
@@ -659,11 +738,19 @@ fn cmd_export(args: &[String]) -> Result<()> {
         .with_context(|| format!("creature {creature_id} has no clips"))?;
     let decoded = mesh::parse(&archive.decompressed(mesh_clip.mesh.index as usize)?)?;
     let stream = gpu::parse_stream(&decoded.commands)?;
-    let geometry = gpu::build_geometry(
+    let mut geometry = gpu::build_geometry(
         &decoded,
         stream.world_root_bone_count()?,
         stream.gpu_commands()?,
     )?;
+
+    // glTF wants the coordinates exactly as the DS had them, so this is normally a no-op and only
+    // `--uv-flip` moves it.
+    if orientation != gpu::UvOrientation::Ds {
+        for uv in &mut geometry.uvs {
+            *uv = orientation.apply(*uv);
+        }
+    }
 
     let mut animations = Vec::with_capacity(wanted.len());
     for clip in &wanted {
@@ -672,12 +759,12 @@ fn cmd_export(args: &[String]) -> Result<()> {
         )?);
     }
 
-    // slot 2 is the one clip nobody has identified, so it gets a positional name
+    // slot 2 is the one clip whose name is still positional
     let names: Vec<String> = wanted
         .iter()
         .map(|clip| {
             let label = manifest::clip_label(clip.slot);
-            if label == "unknown" || label == "unused" {
+            if label == "unused" {
                 format!("clip-{}", clip.slot)
             } else {
                 label.to_string()
@@ -694,7 +781,48 @@ fn cmd_export(args: &[String]) -> Result<()> {
         })
         .collect();
 
-    let (bytes, split) = gltf_out::build(&decoded, &geometry, &name, &clips)?;
+    // A group's palette base is the key the texture set's images are named by, so that is how a
+    // material finds its image.
+    let textures = texture::parse(&archive.decompressed(mesh_clip.texture.index as usize)?)?;
+    let by_key = textures.by_material_key();
+
+    let material_names: Vec<String> = geometry
+        .groups
+        .iter()
+        .map(|group| {
+            match group
+                .palette_base
+                .and_then(|key| by_key.get(&key).copied())
+            {
+                Some(image) => image.name.clone(),
+                None => match group.palette_base {
+                    Some(key) => format!("material_{key}"),
+                    None => "material_none".to_string(),
+                },
+            }
+        })
+        .collect();
+
+    let material_sources: Vec<gltf_out::MaterialSource<'_>> = geometry
+        .groups
+        .iter()
+        .zip(&material_names)
+        .map(|(group, name)| gltf_out::MaterialSource {
+            name: name.as_str(),
+            image: group
+                .palette_base
+                .and_then(|key| by_key.get(&key).copied())
+                .map(|image| gltf_out::ImageSource {
+                    width: image.width as u32,
+                    height: image.height as u32,
+                    pixels: &image.pixels,
+                    alpha_mask: image.transparent,
+                }),
+        })
+        .collect();
+
+    let (bytes, split) =
+        gltf_out::build(&decoded, &geometry, &name, &clips, &material_sources)?;
     std::fs::write(&output, &bytes).with_context(|| format!("writing {}", output.display()))?;
 
     let triangles: usize = split.groups.iter().map(Vec::len).sum::<usize>() / 3;
@@ -705,7 +833,46 @@ fn cmd_export(args: &[String]) -> Result<()> {
         geometry.positions.len()
     );
     println!("triangles    : {triangles}");
+    println!("uv flip      : {}", orientation.name());
+    if let Some((min, max)) = geometry.uv_bounds() {
+        println!(
+            "uv range     : u {:.4} .. {:.4}   v {:.4} .. {:.4}",
+            min[0], max[0], min[1], max[1]
+        );
+    }
     println!("primitives   : {}", split.groups.len());
+    println!("images       : {}", textures.images.len());
+    for image in &textures.images {
+        println!(
+            "  {:<12} {}x{} {}{}",
+            image.name,
+            image.width,
+            image.height,
+            image.format.name(),
+            if image.transparent {
+                ", transparent key"
+            } else {
+                ""
+            }
+        );
+    }
+    println!("materials    : {}", material_sources.len());
+    for source in &material_sources {
+        match &source.image {
+            Some(image) => println!(
+                "  {:<12} {}x{}{}",
+                source.name,
+                image.width,
+                image.height,
+                if image.alpha_mask {
+                    ", transparency key"
+                } else {
+                    ""
+                }
+            ),
+            None => println!("  {:<12} no matching image", source.name),
+        }
+    }
     println!("joints       : {}", decoded.bones.len());
     println!(
         "winding      : {}",
@@ -725,6 +892,54 @@ fn cmd_export(args: &[String]) -> Result<()> {
         );
     }
     println!("wrote        : {} bytes to {}", bytes.len(), output.display());
+
+    Ok(())
+}
+
+/// Writes a creature's texture images out as loose PNGs, so a sheet can be looked at on its own.
+///
+/// The same images are embedded in the creature's `.glb`; this exists so one sheet can be put beside a
+/// model's UV layout without digging it out of the binary.
+fn cmd_textures(args: &[String]) -> Result<()> {
+    let rom_path = arg(args, 0, "rom")?;
+    let creature_id: usize = arg(args, 1, "creature")?
+        .parse()
+        .context("creature id must be a number")?;
+    let out_dir = PathBuf::from(arg(args, 2, "outdir")?);
+
+    let rom = nds::Rom::open(&rom_path)?;
+    let (archive, _) = open_archive(&rom, "model/battle/arcdin")?;
+    let parsed = manifest::parse(&archive.decompressed(0)?)?;
+    let creature = parsed
+        .find(creature_id)
+        .with_context(|| format!("creature {creature_id} is not in the manifest"))?;
+    let clip = creature
+        .clips
+        .first()
+        .with_context(|| format!("creature {creature_id} has no clips"))?;
+
+    let textures = texture::parse(&archive.decompressed(clip.texture.index as usize)?)?;
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+
+    for image in &textures.images {
+        let path = out_dir.join(format!("{}.png", image.name));
+        std::fs::write(&path, image.to_png()?)
+            .with_context(|| format!("writing {}", path.display()))?;
+
+        println!(
+            "{:<12} {}x{} {}{} -> {}",
+            image.name,
+            image.width,
+            image.height,
+            image.format.name(),
+            if image.transparent {
+                ", transparent key"
+            } else {
+                ""
+            },
+            path.display()
+        );
+    }
 
     Ok(())
 }

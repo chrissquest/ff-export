@@ -31,6 +31,7 @@ pub mod mcm;
 pub mod mesh;
 pub mod names;
 pub mod nds;
+pub mod texture;
 
 /// Magic bytes that mark an archive this crate can unpack.
 pub const MAR_MAGIC: &[u8; 3] = b"MAR";

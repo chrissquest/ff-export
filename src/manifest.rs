@@ -75,16 +75,16 @@ impl Manifest {
 /// What each clip slot is, established by comparing the exported clips against in-game footage.
 ///
 /// Slot 1 is the full attack animation; the game truncates it at run time to present a one, two or
-/// three hit attack, so what we export is the complete animation. Slot 2 is rare - only 36 of the
-/// 116 creatures have it - and has not been identified.
+/// three hit attack, so what we export is the complete animation. Slot 2 is a distinct secondary
+/// attack - only 36 of the 116 creatures have it - and it plays fully, unlike the combo in slot 1.
 pub fn clip_label(slot: usize) -> &'static str {
     match slot {
         1 => "attack",
-        2 => "unknown",
+        2 => "attack-secondary",
         3 => "roar",
         4 => "victory",
-        5 => "hit",
-        6 => "critical-hit",
+        5 => "hurt",
+        6 => "hurt-critical",
         7 => "idle",
         _ => "unused",
     }

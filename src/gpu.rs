@@ -12,7 +12,8 @@
 //!
 //! The GPU list itself is standard DS hardware, not a bespoke format: commands arrive **four to a
 //! word**, and each command's 32-bit arguments follow in order. Parameters are 20.12 fixed point for
-//! matrices and 4.12 for vertex and texture coordinates (see [`crate::fixed`]).
+//! matrices and 4.12 for vertex coordinates, while texture coordinates are **12.4** - units of 1/16
+//! texel, which the texture size then normalises (see [`crate::fixed`]).
 //!
 //! Geometry comes out of a state machine that mirrors how the hardware works: `matrixRestore`
 //! selects the bone the following vertices bind to, `texturePaletteBase` selects the material,
@@ -137,6 +138,11 @@ pub enum Command {
     Noop,
     MatrixRestore(u32),
     MatrixIdentity,
+    /// `matrixMode`: 0 projection, 1 position, 2 texture. Kept because a matrix in *texture* mode
+    /// would transform every texture coordinate, and the reference ignores these entirely.
+    MatrixMode(u32),
+    /// `matrixScale` in the current mode.
+    MatrixScale([f64; 3]),
     MatrixLoad4x3([f64; 12]),
     TextureCoordinate([f64; 2]),
     Normal(u32),
@@ -159,6 +165,15 @@ fn read_pair(reader: &mut Reader<'_>) -> Result<[f64; 2]> {
     ])
 }
 
+/// Reads a texture coordinate: two **12.4** values, i.e. units of 1/16 texel, not the 4.12 the vertex
+/// commands use.
+fn read_uv(reader: &mut Reader<'_>) -> Result<[f64; 2]> {
+    Ok([
+        fixed::from_124(reader.u16()? as i16),
+        fixed::from_124(reader.u16()? as i16),
+    ])
+}
+
 /// Parses the GPU command list held by a `0x52` block.
 pub fn parse_gpu_commands(data: &[u8]) -> Result<Vec<Command>> {
     let mut reader = Reader::new(data);
@@ -176,6 +191,14 @@ pub fn parse_gpu_commands(data: &[u8]) -> Result<Vec<Command>> {
                 Opcode::Noop => Command::Noop,
                 Opcode::MatrixRestore => Command::MatrixRestore(reader.u32()?),
                 Opcode::MatrixIdentity => Command::MatrixIdentity,
+                Opcode::MatrixMode => Command::MatrixMode(reader.u32()?),
+                Opcode::MatrixScale => {
+                    let mut values = [0.0f64; 3];
+                    for value in &mut values {
+                        *value = fixed::from_2012(reader.u32()?);
+                    }
+                    Command::MatrixScale(values)
+                }
                 Opcode::MatrixLoad4x3 => {
                     let mut values = [0.0f64; 12];
                     for value in &mut values {
@@ -183,7 +206,7 @@ pub fn parse_gpu_commands(data: &[u8]) -> Result<Vec<Command>> {
                     }
                     Command::MatrixLoad4x3(values)
                 }
-                Opcode::TextureCoordinate => Command::TextureCoordinate(read_pair(&mut reader)?),
+                Opcode::TextureCoordinate => Command::TextureCoordinate(read_uv(&mut reader)?),
                 Opcode::Normal => Command::Normal(reader.u32()?),
                 Opcode::Vertex16 => {
                     let vertex = [
@@ -353,6 +376,63 @@ pub struct Geometry {
     pub groups: Vec<MaterialGroup>,
 }
 
+/// How the DS's texture coordinates map onto the target format.
+///
+/// The DS samples a texture with (0, 0) at its **top-left** and V growing **downwards**, because a
+/// texture's first byte is its top-left texel and the hardware's T axis runs down from there. glTF
+/// uses the same convention, so a faithful port needs no change at all.
+///
+/// OBJ and COLLADA are the odd ones out - their v runs *upwards* from a bottom-left origin - and that
+/// is where the flip in the reference tool came from: it was written to write OBJ, flipped V for it,
+/// and then left the flip in place for its USD output too (its own comment wonders about it). Our
+/// output matched that flip exactly, which is why the textures came out mirrored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UvOrientation {
+    /// Leave the coordinates alone: what the DS hardware sampled and what glTF expects. The default.
+    #[default]
+    Ds,
+    /// `1 - v`, which is what the reference tool writes for every format.
+    FlipV,
+    /// `1 - u`.
+    FlipU,
+    /// Swap `u` and `v`.
+    Swap,
+}
+
+impl UvOrientation {
+    /// Parses a `--uv-flip` value.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "none" | "ds" => Some(UvOrientation::Ds),
+            "v" | "flip-v" => Some(UvOrientation::FlipV),
+            "u" | "flip-u" => Some(UvOrientation::FlipU),
+            "swap" => Some(UvOrientation::Swap),
+            _ => None,
+        }
+    }
+
+    /// A short label, for reports and the command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            UvOrientation::Ds => "none",
+            UvOrientation::FlipV => "v",
+            UvOrientation::FlipU => "u",
+            UvOrientation::Swap => "swap",
+        }
+    }
+
+    /// Applies the mapping to one normalised texture coordinate.
+    pub fn apply(self, uv: [f64; 2]) -> [f64; 2] {
+        match self {
+            UvOrientation::Ds => uv,
+            UvOrientation::FlipV => [uv[0], 1.0 - uv[1]],
+            UvOrientation::FlipU => [1.0 - uv[0], uv[1]],
+            UvOrientation::Swap => [uv[1], uv[0]],
+        }
+    }
+}
+
+
 impl Geometry {
     pub fn face_count(&self) -> usize {
         self.groups.iter().map(|group| group.polygons.len()).sum()
@@ -374,6 +454,23 @@ impl Geometry {
             .flat_map(|group| &group.polygons)
             .map(|polygon| polygon.len().saturating_sub(2))
             .sum()
+    }
+
+    /// The range the texture coordinates cover, as (min, max).
+    ///
+    /// Worth reporting: a creature whose whole model samples a fraction of one texel renders as a
+    /// single blurry colour, which is exactly what a wrong fixed-point scale does.
+    pub fn uv_bounds(&self) -> Option<([f64; 2], [f64; 2])> {
+        let first = self.uvs.first()?;
+        let mut min = *first;
+        let mut max = *first;
+        for uv in &self.uvs {
+            for axis in 0..2 {
+                min[axis] = min[axis].min(uv[axis]);
+                max[axis] = max[axis].max(uv[axis]);
+            }
+        }
+        Some((min, max))
     }
 
     /// The bounding box of the vertex list, as (min, max).
@@ -584,7 +681,10 @@ pub fn build_geometry(
                 state.bone = Some(bone as usize);
             }
             Command::TextureCoordinate(uv) => {
-                state.uv = [uv[0] * state.uv_scale[0], 1.0 - uv[1] * state.uv_scale[1]];
+                // The DS's own space: origin top-left, V down, which is already what glTF wants, so
+                // nothing is flipped or swapped here. See [`UvOrientation`] for why the reference tool
+                // does flip, and for the flag that reproduces it.
+                state.uv = [uv[0] * state.uv_scale[0], uv[1] * state.uv_scale[1]];
             }
             Command::TextureImageParameter(raw) => {
                 let width_shift = (raw >> 20) & 0b111;
@@ -611,6 +711,8 @@ pub fn build_geometry(
             // the reference also ignores, and normals (parsed, but not yet used).
             Command::Noop
             | Command::Skipped(_)
+            | Command::MatrixMode(_)
+            | Command::MatrixScale(_)
             | Command::MatrixLoad4x3(_)
             | Command::Normal(_) => {}
         }

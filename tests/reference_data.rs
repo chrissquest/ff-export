@@ -5,9 +5,10 @@
 //! clone still passes; running locally tells us whether the implementation still matches the
 //! reference byte for byte.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use ff_export::{anim, gltf_out, gpu, manifest, mar, mesh, names, nds};
+use ff_export::{anim, gltf_out, gpu, manifest, mar, mesh, names, nds, texture};
 
 const ROM: &str = "externals/Fossil Fighters (USA).nds";
 const MANIFEST_JSON: &str = "externals/knowledge/arcdin.3cl.json";
@@ -225,6 +226,150 @@ fn decode(archive: &mar::Archive<'_>, mesh_index: u32) -> (mesh::Mesh, gpu::Geom
     (decoded, geometry)
 }
 
+/// The texture coordinates the reference exported for one creature.
+///
+/// The `.usda` writes them as one flat `(u, v)` list with `faceVarying` interpolation, so entries
+/// repeat per corner.
+fn reference_texture_coordinates(path: &Path) -> Option<Vec<[f64; 2]>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let marker = "texCoord2f[] primvars:st = [";
+    let start = text.find(marker)? + marker.len();
+    let end = start + text[start..].find(']')?;
+
+    let mut values = Vec::new();
+    for entry in text[start..end].split("), (") {
+        let entry = entry.trim_start_matches('(').trim_end_matches(')');
+        let (u, v) = entry.split_once(',')?;
+        values.push([u.trim().parse().ok()?, v.trim().parse().ok()?]);
+    }
+    Some(values)
+}
+
+/// Texture coordinates snapped to the 1/4096 grid the format can express, deduplicated and sorted, so
+/// that float formatting cannot cause a false mismatch.
+fn uv_grid(values: &[[f64; 2]]) -> Vec<(i64, i64)> {
+    let mut grid: Vec<(i64, i64)> = values
+        .iter()
+        .map(|uv| ((uv[0] * 4096.0).round() as i64, (uv[1] * 4096.0).round() as i64))
+        .collect();
+    grid.sort_unstable();
+    grid.dedup();
+    grid
+}
+
+#[test]
+fn m3_no_mesh_loads_a_matrix() {
+    let Some(rom) = rom() else { return };
+    let archive = arcdin(&rom);
+    let parsed = manifest::parse(&archive.decompressed(0).unwrap()).unwrap();
+
+    let mut modes: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut scales = 0usize;
+    let mut loads = 0usize;
+    let mut meshes = 0usize;
+
+    for creature in &parsed.creatures {
+        let clip = &creature.clips[0];
+        let data = archive.decompressed(clip.mesh.index as usize).unwrap();
+        let decoded = mesh::parse(&data).unwrap();
+        let stream = gpu::parse_stream(&decoded.commands).unwrap();
+        for command in stream.gpu_commands().unwrap() {
+            match command {
+                gpu::Command::MatrixMode(mode) => *modes.entry(*mode).or_default() += 1,
+                gpu::Command::MatrixScale(_) => scales += 1,
+                gpu::Command::MatrixLoad4x3(_) => loads += 1,
+                _ => {}
+            }
+        }
+        meshes += 1;
+    }
+
+    // A matrix in *texture* mode would transform every texture coordinate at once - a rotation or a
+    // negative scale there would explain a mirrored model - and one in position mode would move every
+    // vertex. The reference ignores all of these commands, which is only safe because this game never
+    // loads one: every mesh issues a single scale (a positive, uniform [+8, +8, +8]) and switches mode
+    // around an identity. This is the test that keeps that true, and the reason texture orientation
+    // comes down to the V axis alone.
+    assert_eq!(
+        loads, 0,
+        "a mesh now loads a matrix, so ignoring matrix commands is no longer safe"
+    );
+    assert_eq!(
+        (
+            scales,
+            modes.get(&2).copied().unwrap_or(0),
+            modes.get(&3).copied().unwrap_or(0)
+        ),
+        (meshes, meshes, meshes),
+        "every mesh should issue one scale and the same two mode switches"
+    );
+    assert!(meshes > 100, "expected every creature, saw {meshes}");
+}
+
+#[test]
+fn m3_texture_coordinates_match_the_reference() {
+    let Some(rom) = rom() else { return };
+    let archive = arcdin(&rom);
+    let parsed = manifest::parse(&archive.decompressed(0).unwrap()).unwrap();
+
+    let reference_dir = Path::new("externals/out/carb_run/ff1_usa/model/battle");
+    if !reference_dir.exists() {
+        eprintln!("skipping: {} is not present", reference_dir.display());
+        return;
+    }
+
+    // A spread of creatures, each compared by UV value and not just by count: a wrong fixed-point
+    // scale still produces the same *number* of coordinates, and it is the values that decide
+    // whether a model samples its texture at all.
+    let mut checked = 0usize;
+    for (creature_id, slot) in [(1usize, 1usize), (2, 1), (5, 1), (30, 1), (116, 1)] {
+        let path = reference_dir.join(format!("vivosaur {creature_id} animation {slot}.usda"));
+        let Some(reference) = reference_texture_coordinates(&path) else {
+            continue;
+        };
+
+        let creature = parsed.find(creature_id).expect("the creature should exist");
+        let clip = creature
+            .clips
+            .iter()
+            .find(|clip| clip.slot == slot)
+            .expect("the clip should exist");
+        let (_, geometry) = decode(&archive, clip.mesh.index);
+
+        let ours = uv_grid(&geometry.uvs);
+        // The reference tool flips V, because it was written for OBJ and COLLADA, where v runs upwards
+        // from a bottom-left origin - and it left the flip in for its USD output too. The DS samples
+        // from the top-left with V running down, exactly like glTF, so our DS-space coordinates are the
+        // reference's mirrored vertically. Asserting that relationship keeps scale, the u direction and
+        // the absence of any rotation gated, while making the one deliberate difference explicit.
+        let theirs = uv_grid(
+            &reference
+                .iter()
+                .map(|uv| [uv[0], 1.0 - uv[1]])
+                .collect::<Vec<_>>(),
+        );
+        let (min, max) = geometry.uv_bounds().expect("the mesh has texture coordinates");
+
+        assert_eq!(
+            ours, theirs,
+            "creature {creature_id}: our {} texture coordinates (u {:.4}..{:.4}, v {:.4}..{:.4}) do \
+             not match the reference's {}",
+            ours.len(),
+            min[0],
+            max[0],
+            min[1],
+            max[1],
+            theirs.len()
+        );
+        checked += 1;
+    }
+
+    assert!(
+        checked >= 4,
+        "expected several creatures to compare, checked {checked}"
+    );
+}
+
 #[test]
 fn m3_breme_matches_the_reference_numbers() {
     let Some(rom) = rom() else { return };
@@ -423,7 +568,8 @@ fn m3_exported_glb_reads_back() {
     let Some(rom) = rom() else { return };
     let archive = arcdin(&rom);
     let (decoded, geometry) = decode(&archive, 384);
-    let (bytes, split) = gltf_out::build(&decoded, &geometry, "Breme", &[]).expect("the glb should build");
+    let (bytes, split) = gltf_out::build(&decoded, &geometry, "Breme", &[], &[])
+        .expect("the glb should build");
 
     // The crate's own reader has to accept what we wrote - that is the spec check.
     let (document, buffers, _images) =
@@ -499,7 +645,7 @@ fn m3_every_creature_exports_a_glb() {
         let (decoded, geometry) = decode(&archive, clip.mesh.index);
         let name = format!("vivosaur_{:03}", creature.id);
 
-        let (bytes, split) = gltf_out::build(&decoded, &geometry, &name, &[])
+        let (bytes, split) = gltf_out::build(&decoded, &geometry, &name, &[], &[])
             .unwrap_or_else(|error| panic!("creature {} clip {}: {error:#}", creature.id, clip.slot));
 
         assert_eq!(&bytes[0..4], b"glTF", "creature {} magic", creature.id);
@@ -621,7 +767,8 @@ fn m4_all_of_a_creatures_clips_land_in_one_glb() {
         .collect();
 
     let (bytes, _split) =
-        gltf_out::build(&decoded, &geometry, "Breme", &clips).expect("the glb should build");
+        gltf_out::build(&decoded, &geometry, "Breme", &clips, &[])
+            .expect("the glb should build");
     let (document, buffers, _images) =
         gltf::import_slice(&bytes).expect("the exported glb should import");
     check_gltf_rules(&bytes, "Breme with clips");
@@ -634,8 +781,8 @@ fn m4_all_of_a_creatures_clips_land_in_one_glb() {
         ("attack", 257usize),
         ("roar", 90),
         ("victory", 200),
-        ("hit", 80),
-        ("critical-hit", 80),
+        ("hurt", 80),
+        ("hurt-critical", 80),
         ("idle", 60),
     ];
 
@@ -664,4 +811,261 @@ fn m4_all_of_a_creatures_clips_land_in_one_glb() {
         assert_eq!(channels, 21 * 3, "clip `{name}`: three channels per bone");
         assert_eq!(samples, frames, "clip `{name}` sample count");
     }
+}
+
+#[test]
+fn m5_texture_images_match_the_reference() {
+    let Some(rom) = rom() else { return };
+    let archive = arcdin(&rom);
+    let parsed = manifest::parse(&archive.decompressed(0).unwrap()).unwrap();
+
+    let reference_dir = Path::new("externals/out/carb_run/ff1_usa/model/battle/arcdin.mar");
+    if !reference_dir.exists() {
+        eprintln!("skipping: {} is not present", reference_dir.display());
+        return;
+    }
+
+    let mut creatures_checked = 0usize;
+    let mut images_checked = 0usize;
+    let mut palettes_checked = 0usize;
+
+    for creature in &parsed.creatures {
+        let clip = &creature.clips[0];
+        let reference_path = reference_dir.join(format!("{:04}.texture.json", clip.texture.index));
+        if !reference_path.exists() {
+            continue;
+        }
+
+        let reference: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&reference_path).expect("the reference should read"),
+        )
+        .expect("the reference should be JSON");
+
+        let textures = texture::parse(&archive.decompressed(clip.texture.index as usize).unwrap())
+            .unwrap_or_else(|error| panic!("creature {}: {error:#}", creature.id));
+
+        let expected = reference["images"].as_array().expect("the images array");
+        assert_eq!(
+            textures.images.len(),
+            expected.len(),
+            "creature {}: image count",
+            creature.id
+        );
+
+        for (ours, theirs) in textures.images.iter().zip(expected) {
+            let at = format!("creature {} image `{}`", creature.id, ours.name);
+            assert_eq!(ours.name, theirs["name"].as_str().expect("a name"), "{at}: name");
+            assert_eq!(
+                ours.width as u64,
+                theirs["info"]["width"].as_u64().expect("a width"),
+                "{at}: width"
+            );
+            assert_eq!(
+                ours.height as u64,
+                theirs["info"]["height"].as_u64().expect("a height"),
+                "{at}: height"
+            );
+            assert_eq!(
+                u32::try_from(theirs["paletteOffset"].as_u64().expect("an offset")).unwrap(),
+                ours.palette_offset,
+                "{at}: palette offset"
+            );
+            assert_eq!(
+                theirs["info"]["transparent"].as_bool().expect("a flag"),
+                ours.transparent,
+                "{at}: transparency flag"
+            );
+
+            // Every pixel is a palette lookup, so matching the palette entry for entry pins the
+            // 5-bit-to-8-bit expansion and the palette's own layout.
+            let palette = theirs["palette"].as_array().expect("the palette array");
+            assert_eq!(ours.palette.len(), palette.len(), "{at}: palette entries");
+            for (index, (colour, reference)) in ours.palette.iter().zip(palette).enumerate() {
+                let expected = reference.as_str().expect("a colour");
+                let ours = format!("#{:02x}{:02x}{:02x}", colour[0], colour[1], colour[2]);
+                assert_eq!(ours, expected, "{at}: palette entry {index}");
+            }
+
+            assert_eq!(
+                ours.pixels.len(),
+                ours.width * ours.height * 4,
+                "{at}: decoded pixel count"
+            );
+
+            palettes_checked += palette.len();
+            images_checked += 1;
+        }
+        creatures_checked += 1;
+    }
+
+    assert!(
+        creatures_checked > 100,
+        "expected most creatures to have a reference texture, checked {creatures_checked}"
+    );
+    assert!(
+        images_checked > 200,
+        "expected more than 200 images, checked {images_checked}"
+    );
+    assert!(
+        palettes_checked > 30_000,
+        "expected more than 30000 palette entries, checked {palettes_checked}"
+    );
+}
+
+#[test]
+fn m5_a_glb_carries_the_creatures_textures() {
+    let Some(rom) = rom() else { return };
+    let archive = arcdin(&rom);
+    let parsed = manifest::parse(&archive.decompressed(0).unwrap()).unwrap();
+    let breme = parsed.find(30).expect("Breme");
+
+    let (decoded, geometry) = decode(&archive, breme.clips[0].mesh.index);
+    let textures =
+        texture::parse(&archive.decompressed(breme.clips[0].texture.index as usize).unwrap())
+            .expect("Breme's textures should parse");
+    let by_key = textures.by_material_key();
+
+    // the same resolution the command line tool does: a group's palette base names its image
+    let matched: Vec<Option<&texture::Image>> = geometry
+        .groups
+        .iter()
+        .map(|group| group.palette_base.and_then(|key| by_key.get(&key).copied()))
+        .collect();
+
+    let names: Vec<String> = matched
+        .iter()
+        .map(|image| match image {
+            Some(image) => image.name.clone(),
+            None => "unmatched".to_string(),
+        })
+        .collect();
+
+    let sources: Vec<gltf_out::MaterialSource<'_>> = geometry
+        .groups
+        .iter()
+        .zip(&names)
+        .zip(&matched)
+        .map(|((_group, name), image)| gltf_out::MaterialSource {
+            name: name.as_str(),
+            image: image.map(|image| gltf_out::ImageSource {
+                width: image.width as u32,
+                height: image.height as u32,
+                pixels: &image.pixels,
+                alpha_mask: image.transparent,
+            }),
+        })
+        .collect();
+
+    assert!(
+        sources.iter().all(|source| source.image.is_some()),
+        "every one of Breme's material groups should find its image"
+    );
+
+    let (bytes, _split) = gltf_out::build(&decoded, &geometry, "Breme", &[], &sources)
+        .expect("the glb should build");
+    check_gltf_rules(&bytes, "Breme with textures");
+
+    let (document, _buffers, images) =
+        gltf::import_slice(&bytes).expect("the exported glb should import");
+
+    // both images are embedded and decode back to the sizes the texture block declared
+    let mut sizes: Vec<(u32, u32)> = images.iter().map(|image| (image.width, image.height)).collect();
+    sizes.sort_unstable();
+    assert_eq!(sizes, [(32, 32), (128, 128)], "one 128x128 and one 32x32");
+
+    for image in &images {
+        assert_eq!(image.format, gltf::image::Format::R8G8B8A8, "RGBA8");
+        assert_eq!(
+            image.pixels.len(),
+            (image.width * image.height * 4) as usize,
+            "a full image of pixels"
+        );
+    }
+
+    // the colour key survives the trip: `din030_a` is flagged transparent, so its keyed pixels are
+    // fully transparent in the PNG
+    let keyed = images
+        .iter()
+        .find(|image| image.width == 128)
+        .expect("the 128x128 image");
+    assert!(
+        keyed
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] == 0),
+        "the colour keyed background should be transparent"
+    );
+
+    let mut materials: Vec<String> = document
+        .materials()
+        .map(|material| material.name().unwrap_or_default().to_string())
+        .collect();
+    materials.sort();
+    assert_eq!(
+        materials,
+        ["din030_a", "din030_b"],
+        "materials are named after their images"
+    );
+
+    for material in document.materials() {
+        assert!(
+            material
+                .pbr_metallic_roughness()
+                .base_color_texture()
+                .is_some(),
+            "`{}` should carry a base colour texture",
+            material.name().unwrap_or("?")
+        );
+    }
+
+    let masked: Vec<&str> = document
+        .materials()
+        .filter(|material| material.alpha_mode() == gltf::material::AlphaMode::Mask)
+        .filter_map(|material| material.name())
+        .collect();
+    assert_eq!(masked, ["din030_a"], "only the keyed image is alpha masked");
+}
+
+#[test]
+fn m5_every_material_group_across_the_roster_finds_its_image() {
+    let Some(rom) = rom() else { return };
+    let archive = arcdin(&rom);
+    let parsed = manifest::parse(&archive.decompressed(0).unwrap()).unwrap();
+
+    let mut groups = 0usize;
+    let mut unmatched = Vec::new();
+
+    for creature in &parsed.creatures {
+        let clip = &creature.clips[0];
+        let textures = texture::parse(&archive.decompressed(clip.texture.index as usize).unwrap())
+            .unwrap_or_else(|error| panic!("creature {}: {error:#}", creature.id));
+        let by_key = textures.by_material_key();
+
+        let (_, geometry) = decode(&archive, clip.mesh.index);
+        for group in &geometry.groups {
+            groups += 1;
+            let matched = group
+                .palette_base
+                .and_then(|key| by_key.get(&key))
+                .is_some();
+            if !matched {
+                unmatched.push(format!(
+                    "creature {} palette base {:?}",
+                    creature.id, group.palette_base
+                ));
+            }
+        }
+    }
+
+    assert!(
+        unmatched.is_empty(),
+        "{} material groups matched no image: {unmatched:?}",
+        unmatched.len()
+    );
+    assert!(
+        groups > 200,
+        "expected more than 200 material groups, saw {groups}"
+    );
 }
