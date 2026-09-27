@@ -2,6 +2,7 @@
 name = "ff-export"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 description = "Fossil Fighters (NDS) -> glTF/GLB asset exporter"
 publish = false
 
