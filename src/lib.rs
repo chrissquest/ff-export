@@ -20,6 +20,7 @@
 
 pub mod anim;
 pub mod bytes;
+pub mod catalog;
 pub mod codec;
 pub mod fixed;
 pub mod gltf_out;

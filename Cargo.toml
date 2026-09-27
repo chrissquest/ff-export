@@ -12,9 +12,9 @@ publish = false
 anyhow = "1"
 gltf = "1"
 png = "0.17"
-
-[dev-dependencies]
-# Only used by the tests that gate our output against the reference data in externals/.
+# The catalog is data, so it is serialised rather than formatted by hand, and the tests read the
+# reference JSON with the same crate. Both are already in the tree behind `gltf`.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [profile.release]

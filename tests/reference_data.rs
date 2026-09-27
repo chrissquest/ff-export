@@ -258,6 +258,106 @@ fn uv_grid(values: &[[f64; 2]]) -> Vec<(i64, i64)> {
 }
 
 #[test]
+fn m6_every_clip_exports_and_reloads() {
+    let Some(rom) = rom() else { return };
+    let archive = arcdin(&rom);
+    let parsed = manifest::parse(&archive.decompressed(0).unwrap()).unwrap();
+
+    let mut creatures = 0usize;
+    let mut files = 0usize;
+
+    for creature in &parsed.creatures {
+        for clip in &creature.clips {
+            let context = format!("creature {} clip {} ({})", creature.id, clip.slot, manifest::clip_label(clip.slot));
+
+            // One clip per file, because each clip names its own mesh - so the clip and its own mesh
+            // have to agree, and that agreement is what makes a file self-contained.
+            let (decoded, geometry) = decode(&archive, clip.mesh.index);
+            let animation = anim::parse(&archive.decompressed(clip.animation.index as usize).unwrap())
+                .unwrap_or_else(|error| panic!("{context}: {error:#}"));
+            assert_eq!(
+                animation.bone_count,
+                decoded.bones.len(),
+                "{context}: the clip animates {} bones but its own mesh has {}",
+                animation.bone_count,
+                decoded.bones.len()
+            );
+
+            let textures = texture::parse(&archive.decompressed(clip.texture.index as usize).unwrap())
+                .unwrap_or_else(|error| panic!("{context}: {error:#}"));
+            let by_key = textures.by_material_key();
+            let names: Vec<String> = geometry
+                .groups
+                .iter()
+                .map(|group| {
+                    group
+                        .palette_base
+                        .and_then(|key| by_key.get(&key).copied())
+                        .map(|image| image.name.clone())
+                        .unwrap_or_else(|| "unmatched".to_string())
+                })
+                .collect();
+            let sources: Vec<gltf_out::MaterialSource<'_>> = geometry
+                .groups
+                .iter()
+                .zip(&names)
+                .map(|(group, name)| gltf_out::MaterialSource {
+                    name: name.as_str(),
+                    image: group
+                        .palette_base
+                        .and_then(|key| by_key.get(&key).copied())
+                        .map(|image| gltf_out::ImageSource {
+                            width: image.width as u32,
+                            height: image.height as u32,
+                            pixels: &image.pixels,
+                            alpha_mask: image.transparent,
+                        }),
+                })
+                .collect();
+
+            let label = manifest::clip_label(clip.slot);
+            let clips = [gltf_out::Clip {
+                name: label,
+                animation: &animation,
+            }];
+            let (bytes, _split) =
+                gltf_out::build(&decoded, &geometry, "creature", &clips, &sources)
+                    .unwrap_or_else(|error| panic!("{context}: {error:#}"));
+            check_gltf_rules(&bytes, &context);
+
+            let (document, _buffers, images) = gltf::import_slice(&bytes)
+                .unwrap_or_else(|error| panic!("{context}: the glb did not import: {error:#}"));
+
+            assert_eq!(document.animations().count(), 1, "{context}: one clip, one animation");
+            assert_eq!(
+                document.animations().next().unwrap().name(),
+                Some(label),
+                "{context}: the animation's name"
+            );
+            assert_eq!(
+                document
+                    .skins()
+                    .next()
+                    .map(|skin| skin.joints().count())
+                    .unwrap_or(0),
+                decoded.bones.len(),
+                "{context}: the joints"
+            );
+            assert!(
+                !images.is_empty(),
+                "{context}: the sheets should be embedded"
+            );
+
+            files += 1;
+        }
+        creatures += 1;
+    }
+
+    assert_eq!(creatures, 116, "every creature");
+    assert_eq!(files, 698, "every clip");
+}
+
+#[test]
 fn m3_no_mesh_loads_a_matrix() {
     let Some(rom) = rom() else { return };
     let archive = arcdin(&rom);
