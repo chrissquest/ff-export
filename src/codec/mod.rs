@@ -24,11 +24,11 @@
 //! values match the Nitro compression types.
 //!
 //! Measured across all 8,041 archives of this game, the two `MCM` slots hold
-//! `none` 29,269, `lzss` 9,158, `huffman` 2,143 and `rle` 668 times -- but Huffman
-//! and run length never appear in the 3D model or animation path
-//! (`model/battle/arcdin`, `motion/battle_creature`). Only `none` and LZ10 are
-//! implemented here; the other two fail loudly rather than guessing.
+//! `none` 29,269, `lzss` 9,158, `huffman` 2,143 and `rle` 668 times. Huffman is implemented
+//! because most of the game's text uses it (including `text/japanese`, which holds the creature
+//! names); run length is not implemented and fails loudly rather than guessing.
 
+pub mod huffman;
 pub mod lz10;
 
 use anyhow::{Result, bail};
@@ -101,10 +101,7 @@ impl Codec {
                 "run-length compressed chunks are not implemented yet ({} bytes)",
                 data.len()
             ),
-            Codec::Huffman => bail!(
-                "huffman compressed chunks are not implemented yet ({} bytes)",
-                data.len()
-            ),
+            Codec::Huffman => huffman::decompress(data),
         }
     }
 }

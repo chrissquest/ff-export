@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
-use ff_export::{mar, mcm, nds};
+use ff_export::{manifest, mar, mcm, names, nds};
 
 const USAGE: &str = "\
 ff-export - Fossil Fighters (NDS) asset extraction
@@ -21,6 +21,8 @@ COMMANDS:
     list    <rom> [substring]           list ROM files (id, size, path)
     unpack  <rom> <path> <outdir>       decompress one MAR archive into NNNN.bin
     verify  <rom> <path> <refdir>       diff that output against a reference tree
+    manifest <rom> [limit]              creature -> mesh/animation/texture mapping
+    names   <rom> [all]                 the 116 creature id -> name pairs
     hexdump <rom> <path> <entry> [len]  raw stored bytes of one entry, for analysis
     help                                show this text
 ";
@@ -34,6 +36,8 @@ fn main() -> ExitCode {
         Some("unpack") => cmd_unpack(&args[1..]),
         Some("verify") => cmd_verify(&args[1..]),
         Some("hexdump") => cmd_hexdump(&args[1..]),
+        Some("manifest") => cmd_manifest(&args[1..]),
+        Some("names") => cmd_names(&args[1..]),
         Some("help") | None | Some("-h") | Some("--help") => {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -319,6 +323,100 @@ fn cmd_hexdump(args: &[String]) -> Result<()> {
         print!(" {byte:02X}");
     }
     println!();
+
+    Ok(())
+}
+
+/// Prints the creature -> mesh/animation/texture mapping from the `3CL` manifest.
+fn cmd_manifest(args: &[String]) -> Result<()> {
+    let rom_path = arg(args, 0, "rom")?;
+    let limit: usize = match args.get(1) {
+        Some(value) => value.parse().context("limit must be a number")?,
+        None => 8,
+    };
+
+    let rom = nds::Rom::open(&rom_path)?;
+    let name_table = creature_names(&rom).ok();
+    let (archive, _) = open_archive(&rom, "model/battle/arcdin")?;
+    let data = archive.decompressed(0)?;
+    let parsed = manifest::parse(&data)
+        .context("parsing the 3CL manifest in model/battle/arcdin entry 0")?;
+
+    println!(
+        "manifest     : {} bytes, {} creatures, {} clips",
+        data.len(),
+        parsed.creatures.len(),
+        parsed.clip_count()
+    );
+
+    let mut histogram: BTreeMap<usize, usize> = BTreeMap::new();
+    for creature in &parsed.creatures {
+        *histogram.entry(creature.clips.len()).or_default() += 1;
+    }
+    let summary: Vec<String> = histogram
+        .iter()
+        .map(|(clips, count)| format!("{clips} clips x{count}"))
+        .collect();
+    println!("clip counts  : {}", summary.join(", "));
+
+    println!();
+    println!(
+        "{:>4}  {:<12}  {:<14}  {}",
+        "id", "name", "clip slots", "mesh / animation / texture"
+    );
+    for creature in parsed.creatures.iter().take(limit) {
+        let slots: Vec<String> = creature.clips.iter().map(|c| c.slot.to_string()).collect();
+        let first = &creature.clips[0];
+        let name = name_table
+            .as_ref()
+            .and_then(|names| names.get(creature.id - 1))
+            .map(String::as_str)
+            .unwrap_or("-");
+        println!(
+            "{:>4}  {:<12}  {:<14}  {}:{} / {}:{} / {}:{}",
+            creature.id,
+            name,
+            slots.join(","),
+            first.mesh.table_name,
+            first.mesh.index,
+            first.animation.table_name,
+            first.animation.index,
+            first.texture.table_name,
+            first.texture.index
+        );
+    }
+    if parsed.creatures.len() > limit {
+        println!("      ... {} more", parsed.creatures.len() - limit);
+    }
+
+    Ok(())
+}
+
+/// Reads the creature name table out of the game's text archive.
+fn creature_names(rom: &nds::Rom) -> Result<Vec<String>> {
+    let (archive, _) = open_archive(rom, "text/japanese")?;
+    let text = archive
+        .decompressed(0)
+        .context("decompressing text/japanese entry 0")?;
+    names::creature_names(&text, names::CREATURE_COUNT)
+}
+
+/// Prints the creature id -> name table.
+fn cmd_names(args: &[String]) -> Result<()> {
+    let rom_path = arg(args, 0, "rom")?;
+    let rom = nds::Rom::open(&rom_path)?;
+    let all = creature_names(&rom)?;
+
+    let show_all = args.get(1).map(String::as_str) == Some("all");
+    let limit = if show_all { all.len() } else { 12 };
+
+    println!("creatures    : {}", all.len());
+    for (index, name) in all.iter().take(limit).enumerate() {
+        println!("{:>4}  {}", index + 1, name);
+    }
+    if limit < all.len() {
+        println!("      ... {} more (pass `all` to list every one)", all.len() - limit);
+    }
 
     Ok(())
 }

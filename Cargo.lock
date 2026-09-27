@@ -87,6 +87,7 @@ dependencies = [
  "anyhow",
  "gltf",
  "png 0.17.16",
+ "serde_json",
 ]
 
 [[package]]

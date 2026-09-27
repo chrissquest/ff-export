@@ -20,8 +20,10 @@
 
 pub mod bytes;
 pub mod codec;
+pub mod manifest;
 pub mod mar;
 pub mod mcm;
+pub mod names;
 pub mod nds;
 
 /// Magic bytes that mark an archive this crate can unpack.

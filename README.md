@@ -10,8 +10,8 @@ Early work in progress. The container and compression layers work; no glTF is wr
 | Milestone | Scope | State |
 | --- | --- | --- |
 | M0 | ROM header, FNT, FAT | done |
-| M1 | MAR archives, MCM chunk wrapper, LZ10 | done |
-| M2 | `3CL` manifest → creature → mesh / animation / texture | not started |
+| M1 | MAR archives, MCM chunk wrapper, LZ10, Huffman | done |
+| M2 | `3CL` manifest → creature → mesh / animation / texture, plus creature names | done |
 | M3 | mesh + skeleton → static `.glb` | not started |
 | M4 | animation clips in the `.glb` | not started |
 | M5 | textures → PNG, embedded | not started |
