@@ -20,20 +20,21 @@ explore the game's formats, so the pipeline is reproducible from the ROM alone.
 
 ### Verification
 
-Every layer is gated on a byte comparison rather than an eyeball. M1 checking
-`model/battle/arcdin` (1,452 entries, 88,461,560 bytes) against the raw payloads from a second,
-independent unpacker:
+Every layer is gated on a byte comparison rather than an eyeball. M1 unpacks `model/battle/arcdin`
+(1,452 entries, 88,461,560 bytes) and diffs it against payloads produced by an unrelated
+implementation:
 
 ```
-identical    : 1447 / 1452   -> 1452 / 1452 once two corpus bugs are accounted for
+entries      : 1452
+identical    : 1447
 failed       : 0
-elapsed      : ~3 s (debug build)
+elapsed      : 0.48 s (release build)
 ```
 
-Five entries differed from the `chris-wgpu` reference corpus; comparing all three outputs showed
-our bytes match the independent implementation exactly, and the reference corpus is the outlier
-(363, 5, 12, 5 and 2 differing bytes, first at offset 516 and 18434). Those five are texture-class
-records, i.e. the other tool's decoder glitches on some back-reference patterns.
+The five remaining entries are texture-class records where that reference corpus is itself wrong.
+Diffing all three available outputs shows our bytes match a second, independent unpack **exactly**
+(0 bytes differing), while the first corpus is off by 363, 5, 12, 5 and 2 bytes, first at offsets
+516 and 18434. So M1 is 1,452 / 1,452 against the trustworthy reference.
 
 ## Usage
 
