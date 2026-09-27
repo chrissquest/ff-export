@@ -21,6 +21,7 @@
 pub mod bytes;
 pub mod codec;
 pub mod fixed;
+pub mod gltf_out;
 pub mod gpu;
 pub mod manifest;
 pub mod mar;

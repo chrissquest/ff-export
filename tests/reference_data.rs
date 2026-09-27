@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use ff_export::{gpu, manifest, mar, mesh, names, nds};
+use ff_export::{gltf_out, gpu, manifest, mar, mesh, names, nds};
 
 const ROM: &str = "externals/Fossil Fighters (USA).nds";
 const MANIFEST_JSON: &str = "externals/knowledge/arcdin.3cl.json";
@@ -313,4 +313,110 @@ fn m3_every_clip_of_every_creature_decodes() {
     }
 
     assert_eq!(clips, 698, "the whole roster should decode");
+}
+
+#[test]
+fn m3_exported_glb_reads_back() {
+    let Some(rom) = rom() else { return };
+    let archive = arcdin(&rom);
+    let (decoded, geometry) = decode(&archive, 384);
+    let (bytes, split) = gltf_out::build(&decoded, &geometry, "Breme").expect("the glb should build");
+
+    // The crate's own reader has to accept what we wrote - that is the spec check.
+    let (document, buffers, _images) =
+        gltf::import_slice(&bytes).expect("the exported glb should import");
+
+    let mesh = document.meshes().next().expect("one mesh");
+    let primitives: Vec<_> = mesh.primitives().collect();
+    assert_eq!(primitives.len(), 2, "one primitive per material");
+
+    let mut vertices = 0usize;
+    let mut triangles = 0usize;
+    for primitive in &primitives {
+        let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
+
+        assert!(reader.read_positions().is_some(), "positions");
+        assert!(reader.read_normals().is_some(), "normals");
+        assert!(reader.read_tex_coords(0).is_some(), "uvs");
+        assert!(reader.read_joints(0).is_some(), "joint indices");
+        assert!(reader.read_weights(0).is_some(), "joint weights");
+
+        // both primitives index the same vertex list, so this is not a sum
+        let count = reader.read_positions().unwrap().count();
+        assert_eq!(
+            count,
+            split.positions.len(),
+            "each primitive should index the shared vertex list"
+        );
+        vertices = count;
+
+        let indices: Vec<u32> = reader
+            .read_indices()
+            .expect("indices")
+            .into_u32()
+            .collect();
+        assert_eq!(indices.len() % 3, 0, "indices should form triangles");
+        for index in &indices {
+            assert!(
+                (*index as usize) < split.positions.len(),
+                "index {index} is out of range"
+            );
+        }
+        triangles += indices.len() / 3;
+    }
+
+    assert_eq!(
+        vertices,
+        split.positions.len(),
+        "every split vertex should be in the file"
+    );
+    assert_eq!(triangles, 408, "the reference triangle count");
+
+    let skin = document.skins().next().expect("a skin");
+    assert_eq!(skin.joints().count(), 21, "every bone should be a joint");
+
+    let named = document.nodes().filter(|node| node.name().is_some()).count();
+    assert!(named >= 22, "the mesh node plus 21 named bones, found {named}");
+    assert!(
+        document.nodes().any(|node| node.name() == Some("waist")),
+        "bones keep the game's names"
+    );
+}
+
+#[test]
+fn m3_every_creature_exports_a_glb() {
+    let Some(rom) = rom() else { return };
+    let archive = arcdin(&rom);
+    let parsed = manifest::parse(&archive.decompressed(0).unwrap()).unwrap();
+
+    let mut exported = 0usize;
+    for creature in &parsed.creatures {
+        let clip = &creature.clips[0];
+        let (decoded, geometry) = decode(&archive, clip.mesh.index);
+        let name = format!("vivosaur_{:03}", creature.id);
+
+        let (bytes, split) = gltf_out::build(&decoded, &geometry, &name)
+            .unwrap_or_else(|error| panic!("creature {} clip {}: {error:#}", creature.id, clip.slot));
+
+        assert_eq!(&bytes[0..4], b"glTF", "creature {} magic", creature.id);
+        assert!(!split.positions.is_empty(), "creature {} has no vertices", creature.id);
+
+        let (document, _buffers, _images) = gltf::import_slice(&bytes)
+            .unwrap_or_else(|error| panic!("creature {} does not import: {error:?}", creature.id));
+
+        let skin = document
+            .skins()
+            .next()
+            .unwrap_or_else(|| panic!("creature {} has no skin", creature.id));
+        assert_eq!(
+            skin.joints().count(),
+            decoded.bones.len(),
+            "creature {}: every bone should be a joint",
+            creature.id
+        );
+
+        exported += 1;
+    }
+
+    assert_eq!(exported, 116, "every creature should export");
 }

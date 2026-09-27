@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
-use ff_export::{gpu, manifest, mar, mcm, mesh, names, nds};
+use ff_export::{gltf_out, gpu, manifest, mar, mcm, mesh, names, nds};
 
 const USAGE: &str = "\
 ff-export - Fossil Fighters (NDS) asset extraction
@@ -25,6 +25,7 @@ COMMANDS:
     names   <rom> [all]                 the 116 creature id -> name pairs
     mesh    <rom> <creature> [clip]     parse one creature mesh and report its geometry
     obj     <rom> <creature> [clip] <file.obj>   write the decoded mesh as Wavefront OBJ
+    export  <rom> <creature> [clip] <file.glb>   write the bind-pose mesh and skeleton as .glb
     hexdump <rom> <path> <entry> [len]  raw stored bytes of one entry, for analysis
     help                                show this text
 ";
@@ -42,6 +43,7 @@ fn main() -> ExitCode {
         Some("names") => cmd_names(&args[1..]),
         Some("mesh") => cmd_mesh(&args[1..]),
         Some("obj") => cmd_obj(&args[1..]),
+        Some("export") => cmd_export(&args[1..]),
         Some("help") | None | Some("-h") | Some("--help") => {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -523,7 +525,7 @@ fn cmd_obj(args: &[String]) -> Result<()> {
 
     let output = PathBuf::from(args.last().context("missing <file.obj>")?);
     // `obj <rom> <creature> <file>` or `obj <rom> <creature> <clip> <file>`
-    let clip_slot = match args.len() {
+    let clip_slot: Option<usize> = match args.len() {
         3 => None,
         4 => Some(args[2].parse().context("clip slot must be a number")?),
         _ => return Err(anyhow::anyhow!("expected <rom> <creature> [clip] <file.obj>\n\n{USAGE}")),
@@ -604,6 +606,77 @@ fn cmd_obj(args: &[String]) -> Result<()> {
         triangles,
         output.display()
     );
+
+    Ok(())
+}
+
+/// Writes a creature clip's bind-pose mesh and skeleton as a `.glb`.
+fn cmd_export(args: &[String]) -> Result<()> {
+    let rom_path = arg(args, 0, "rom")?;
+    let creature_id: usize = arg(args, 1, "creature")?
+        .parse()
+        .context("creature id must be a number")?;
+
+    let output = PathBuf::from(args.last().context("missing <file.glb>")?);
+    // `export <rom> <creature> <file>` or `export <rom> <creature> <clip> <file>`
+    let clip_slot: Option<usize> = match args.len() {
+        3 => None,
+        4 => Some(args[2].parse().context("clip slot must be a number")?),
+        _ => return Err(anyhow::anyhow!("expected <rom> <creature> [clip] <file.glb>\n\n{USAGE}")),
+    };
+
+    let rom = nds::Rom::open(&rom_path)?;
+    let (archive, _) = open_archive(&rom, "model/battle/arcdin")?;
+    let parsed = manifest::parse(&archive.decompressed(0)?)?;
+    let creature = parsed
+        .find(creature_id)
+        .with_context(|| format!("creature {creature_id} is not in the manifest"))?;
+
+    let name = creature_names(&rom)
+        .ok()
+        .and_then(|all| all.get(creature_id - 1).cloned())
+        .unwrap_or_else(|| format!("vivosaur_{creature_id:03}"));
+
+    let clip = match clip_slot {
+        Some(slot) => creature
+            .clips
+            .iter()
+            .find(|clip| clip.slot == slot)
+            .with_context(|| format!("creature {creature_id} has no clip slot {slot}"))?,
+        None => &creature.clips[0],
+    };
+
+    let decoded = mesh::parse(&archive.decompressed(clip.mesh.index as usize)?)?;
+    let stream = gpu::parse_stream(&decoded.commands)?;
+    let geometry = gpu::build_geometry(
+        &decoded,
+        stream.world_root_bone_count()?,
+        stream.gpu_commands()?,
+    )?;
+
+    let (bytes, split) = gltf_out::build(&decoded, &geometry, &name)?;
+    std::fs::write(&output, &bytes).with_context(|| format!("writing {}", output.display()))?;
+
+    let triangles: usize = split.groups.iter().map(Vec::len).sum::<usize>() / 3;
+    println!("creature     : {creature_id} {name}");
+    println!("clip         : {} ({})", clip.slot, manifest::clip_label(clip.slot));
+    println!(
+        "vertices     : {} after UV splitting ({} before)",
+        split.positions.len(),
+        geometry.positions.len()
+    );
+    println!("triangles    : {triangles}");
+    println!("primitives   : {}", split.groups.len());
+    println!("joints       : {}", decoded.bones.len());
+    println!(
+        "winding      : {}",
+        if split.reversed {
+            "reversed, so front faces point outwards"
+        } else {
+            "kept, already facing outwards"
+        }
+    );
+    println!("wrote        : {} bytes to {}", bytes.len(), output.display());
 
     Ok(())
 }
