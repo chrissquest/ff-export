@@ -1,0 +1,17 @@
+[package]
+name = "ff-export"
+version = "0.1.0"
+edition = "2024"
+description = "Fossil Fighters (NDS) -> glTF/GLB asset exporter"
+publish = false
+
+[dependencies]
+# Stage 1 (current): crates, to reach a confirmed-working .glb quickly.
+# Stage 2: replace with dependency-free implementations once the output is verified.
+anyhow = "1"
+gltf = "1"
+png = "0.17"
+
+[profile.release]
+opt-level = 3
+
