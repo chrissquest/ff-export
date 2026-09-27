@@ -1,9 +1,16 @@
 //! Gates the pipeline against the reference data in `externals/`.
 //!
-//! `externals/` is not committed - it holds the ROM, the extracted corpora and the third-party
-//! tools used during exploration - so every test here skips cleanly when it is absent. A fresh
-//! clone still passes; running locally tells us whether the implementation still matches the
-//! reference byte for byte.
+//! `externals/` is not committed - it holds the ROMs, carbonizer's output and the corpora the tests
+//! gate against - so every test here skips cleanly when it is absent. A fresh clone still passes;
+//! running locally tells us whether the implementation still matches the reference byte for byte.
+//!
+//! ```text
+//! externals/*.nds           the two input ROMs
+//! externals/out/ff1_usa/    what `export-all` produces
+//! externals/carbonizer/     carbonizer: its source, its build and its FF1 output (the reference)
+//! externals/oracles/        the corpora and tables the tests compare against
+//! externals/documentation/  everything we know, in prose
+//! ```
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -11,8 +18,8 @@ use std::path::Path;
 use ff_export::{anim, gltf_out, gpu, manifest, mar, mesh, names, nds, texture};
 
 const ROM: &str = "externals/Fossil Fighters (USA).nds";
-const MANIFEST_JSON: &str = "externals/knowledge/arcdin.3cl.json";
-const ARCDIN_DUMP: &str = "externals/extracted/mcm_tree/model/battle/arcdin";
+const MANIFEST_JSON: &str = "externals/oracles/arcdin.3cl.json";
+const ARCDIN_DUMP: &str = "externals/oracles/mcm_tree/model/battle/arcdin";
 
 /// Entry indices whose *reference* copy is known to be wrong (see README). Our output matches a
 /// second, independent unpack exactly for these, so they are pinned rather than ignored.
@@ -88,7 +95,7 @@ fn m1_arcdin_decompresses_byte_for_byte() {
 #[test]
 fn m2_creature_names_match_the_reference_csv() {
     let Some(rom) = rom() else { return };
-    let csv_path = Path::new("externals/knowledge/creature_names.csv");
+    let csv_path = Path::new("externals/oracles/creature_names.csv");
     if !csv_path.exists() {
         eprintln!("skipping: {} is not present", csv_path.display());
         return;
@@ -412,7 +419,7 @@ fn m3_texture_coordinates_match_the_reference() {
     let archive = arcdin(&rom);
     let parsed = manifest::parse(&archive.decompressed(0).unwrap()).unwrap();
 
-    let reference_dir = Path::new("externals/out/carb_run/ff1_usa/model/battle");
+    let reference_dir = Path::new("externals/carbonizer/ff1_usa/model/battle");
     if !reference_dir.exists() {
         eprintln!("skipping: {} is not present", reference_dir.display());
         return;
@@ -880,7 +887,7 @@ fn m4_all_of_a_creatures_clips_land_in_one_glb() {
     let expected = [
         ("attack", 257usize),
         ("roar", 90),
-        ("victory", 200),
+        ("cheer", 200),
         ("hurt", 80),
         ("hurt-critical", 80),
         ("idle", 60),
@@ -919,7 +926,7 @@ fn m5_texture_images_match_the_reference() {
     let archive = arcdin(&rom);
     let parsed = manifest::parse(&archive.decompressed(0).unwrap()).unwrap();
 
-    let reference_dir = Path::new("externals/out/carb_run/ff1_usa/model/battle/arcdin.mar");
+    let reference_dir = Path::new("externals/carbonizer/ff1_usa/model/battle/arcdin.mar");
     if !reference_dir.exists() {
         eprintln!("skipping: {} is not present", reference_dir.display());
         return;

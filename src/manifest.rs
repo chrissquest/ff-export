@@ -82,7 +82,7 @@ pub fn clip_label(slot: usize) -> &'static str {
         1 => "attack",
         2 => "attack-secondary",
         3 => "roar",
-        4 => "victory",
+        4 => "cheer",
         5 => "hurt",
         6 => "hurt-critical",
         7 => "idle",

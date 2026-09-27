@@ -15,7 +15,7 @@
 //!
 //! Note on provenance: this is an independent implementation. The formats were
 //! derived from byte-level analysis of this ROM, from the Nintendo DS hardware
-//! documentation, and from the format notes in `chris-wgpu/externals/knowledge`.
+//! documentation, and from the format notes in `externals/documentation`.
 //! No source code from other fan tools is copied here.
 
 pub mod anim;

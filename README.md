@@ -76,7 +76,7 @@ and seven of the remaining slots.
 | 1 | `attack` | the whole combo; the game truncates it at run time for a one, two or three hit attack |
 | 2 | `attack-secondary` | a distinct secondary attack; only 36 of the 116 creatures have one |
 | 3 | `roar` | |
-| 4 | `victory` | |
+| 4 | `cheer` | |
 | 5 | `hurt` | |
 | 6 | `hurt-critical` | |
 | 7 | `idle` | |

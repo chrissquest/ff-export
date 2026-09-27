@@ -1,7 +1,7 @@
 //! `ff-export` command line: inspect a ROM, unpack archives, diff against a
 //! known-good corpus.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -1117,12 +1117,17 @@ fn cmd_export_all(args: &[String]) -> Result<()> {
         creatures,
     };
     let manifest = out_dir.join("manifest.json");
+    // Anything a previous run left behind goes first, so the manifest describes the whole directory.
+    let stale = prune_output(&out_dir, &catalog)?;
     std::fs::write(&manifest, catalog.to_json()?)
         .with_context(|| format!("writing {}", manifest.display()))?;
 
     println!();
     for repeat in &repeats {
         println!("note         : {repeat}");
+    }
+    if stale > 0 {
+        println!("pruned       : {stale} files a previous run left behind");
     }
     println!(
         "exported     : {} creatures, {} clips, {} texture sheets, {} of glb",
@@ -1166,6 +1171,58 @@ fn write_textures(out_dir: &Path, id: usize, name: &str, export: &CreatureExport
     for image in &export.textures.images {
         let path = sheets.join(format!("{}.png", image.name));
         std::fs::write(&path, image.to_png()?).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Removes files under `glb/` and `textures/` that this run did not write, and reports how many.
+///
+/// An export should be exactly what `manifest.json` describes: re-running one after a name changed would
+/// otherwise leave the earlier file behind, which matters when the output is zipped and shipped.
+fn prune_output(out_dir: &Path, catalog: &catalog::Catalog) -> Result<usize> {
+    let mut expected: BTreeSet<String> = BTreeSet::new();
+    for creature in &catalog.creatures {
+        for clip in &creature.clips {
+            expected.insert(clip.glb.clone());
+        }
+        for texture in &creature.textures {
+            expected.insert(texture.file.clone());
+        }
+    }
+
+    let mut removed = 0usize;
+    for folder in ["glb", "textures"] {
+        let mut files = Vec::new();
+        files_under(&out_dir.join(folder), &mut files)?;
+        for file in files {
+            let relative = file
+                .strip_prefix(out_dir)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !expected.contains(&relative) {
+                std::fs::remove_file(&file)
+                    .with_context(|| format!("removing {}", file.display()))?;
+                removed += 1;
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+/// Every file under `dir`, recursively.
+fn files_under(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        if path.is_dir() {
+            files_under(&path, files)?;
+        } else {
+            files.push(path);
+        }
     }
     Ok(())
 }
