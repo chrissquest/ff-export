@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
-use ff_export::{manifest, mar, mcm, names, nds};
+use ff_export::{gpu, manifest, mar, mcm, mesh, names, nds};
 
 const USAGE: &str = "\
 ff-export - Fossil Fighters (NDS) asset extraction
@@ -23,6 +23,8 @@ COMMANDS:
     verify  <rom> <path> <refdir>       diff that output against a reference tree
     manifest <rom> [limit]              creature -> mesh/animation/texture mapping
     names   <rom> [all]                 the 116 creature id -> name pairs
+    mesh    <rom> <creature> [clip]     parse one creature mesh and report its geometry
+    obj     <rom> <creature> [clip] <file.obj>   write the decoded mesh as Wavefront OBJ
     hexdump <rom> <path> <entry> [len]  raw stored bytes of one entry, for analysis
     help                                show this text
 ";
@@ -38,6 +40,8 @@ fn main() -> ExitCode {
         Some("hexdump") => cmd_hexdump(&args[1..]),
         Some("manifest") => cmd_manifest(&args[1..]),
         Some("names") => cmd_names(&args[1..]),
+        Some("mesh") => cmd_mesh(&args[1..]),
+        Some("obj") => cmd_obj(&args[1..]),
         Some("help") | None | Some("-h") | Some("--help") => {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -417,6 +421,189 @@ fn cmd_names(args: &[String]) -> Result<()> {
     if limit < all.len() {
         println!("      ... {} more (pass `all` to list every one)", all.len() - limit);
     }
+
+    Ok(())
+}
+
+/// Parses one creature's mesh and reports the geometry inside it.
+fn cmd_mesh(args: &[String]) -> Result<()> {
+    let rom_path = arg(args, 0, "rom")?;
+    let creature_id: usize = arg(args, 1, "creature")?
+        .parse()
+        .context("creature id must be a number")?;
+    let clip_slot: Option<usize> = match args.get(2) {
+        Some(value) => Some(value.parse().context("clip slot must be a number")?),
+        None => None,
+    };
+
+    let rom = nds::Rom::open(&rom_path)?;
+    let (archive, _) = open_archive(&rom, "model/battle/arcdin")?;
+
+    let parsed = manifest::parse(&archive.decompressed(0)?)?;
+    let creature = parsed
+        .find(creature_id)
+        .with_context(|| format!("creature {creature_id} is not in the manifest"))?;
+
+    let name = creature_names(&rom)
+        .ok()
+        .and_then(|all| all.get(creature_id - 1).cloned())
+        .unwrap_or_else(|| format!("vivosaur {creature_id}"));
+
+    let clip = match clip_slot {
+        Some(slot) => creature.clips.iter().find(|clip| clip.slot == slot).with_context(|| {
+            let available: Vec<usize> = creature.clips.iter().map(|clip| clip.slot).collect();
+            format!("creature {creature_id} has no clip slot {slot}; it has {available:?}")
+        })?,
+        None => &creature.clips[0],
+    };
+
+    println!("creature     : {creature_id} {name}");
+    println!("clip         : {} ({})", clip.slot, manifest::clip_label(clip.slot));
+    println!("mesh entry   : {}:{}", clip.mesh.table_name, clip.mesh.index);
+
+    let data = archive.decompressed(clip.mesh.index as usize)?;
+    let parsed_mesh = mesh::parse(&data)?;
+    println!("mesh bytes   : {}", data.len());
+    println!("scale        : {}", parsed_mesh.scale);
+    println!("keyframes    : {}", parsed_mesh.keyframe_count);
+    println!("bones        : {}", parsed_mesh.bones.len());
+    println!(
+        "bone names   : {}",
+        parsed_mesh
+            .bones
+            .iter()
+            .map(|bone| bone.name.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    println!("model names  : {}", parsed_mesh.model_names.join(" "));
+
+    let stream = gpu::parse_stream(&parsed_mesh.commands)?;
+    let world_root = stream.world_root_bone_count()?;
+    let geometry = gpu::build_geometry(&parsed_mesh, world_root, stream.gpu_commands()?)?;
+
+    println!();
+    println!("vertices     : {}", geometry.positions.len());
+    println!("uvs          : {}", geometry.uvs.len());
+    println!("faces        : {}", geometry.face_count());
+    println!("triangles    : {}", geometry.triangle_count());
+    println!("corners      : {}", geometry.corner_count());
+    println!("materials    : {}", geometry.groups.len());
+    for group in &geometry.groups {
+        let key = match group.palette_base {
+            Some(value) => value.to_string(),
+            None => "-".to_string(),
+        };
+        println!("  material {key:>10} : {} faces", group.polygons.len());
+    }
+
+    if let Some((min, max)) = geometry.bounds() {
+        for (label, axis) in [("X", 0), ("Y", 1), ("Z", 2)] {
+            println!(
+                "bounds {label}     : {0:9.3} .. {1:9.3}   size {2:7.3}",
+                min[axis],
+                max[axis],
+                max[axis] - min[axis]
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Writes the decoded geometry to a Wavefront OBJ, so it can be looked at in any viewer.
+///
+/// The OBJ format carries per-corner texture coordinates, which is exactly how the geometry stores
+/// them, so this needs no vertex splitting.
+fn cmd_obj(args: &[String]) -> Result<()> {
+    let rom_path = arg(args, 0, "rom")?;
+    let creature_id: usize = arg(args, 1, "creature")?
+        .parse()
+        .context("creature id must be a number")?;
+
+    let output = PathBuf::from(args.last().context("missing <file.obj>")?);
+    // `obj <rom> <creature> <file>` or `obj <rom> <creature> <clip> <file>`
+    let clip_slot = match args.len() {
+        3 => None,
+        4 => Some(args[2].parse().context("clip slot must be a number")?),
+        _ => return Err(anyhow::anyhow!("expected <rom> <creature> [clip] <file.obj>\n\n{USAGE}")),
+    };
+
+    let rom = nds::Rom::open(&rom_path)?;
+    let (archive, _) = open_archive(&rom, "model/battle/arcdin")?;
+    let parsed = manifest::parse(&archive.decompressed(0)?)?;
+    let creature = parsed
+        .find(creature_id)
+        .with_context(|| format!("creature {creature_id} is not in the manifest"))?;
+    let clip = match clip_slot {
+        Some(slot) => creature
+            .clips
+            .iter()
+            .find(|clip| clip.slot == slot)
+            .with_context(|| format!("creature {creature_id} has no clip slot {slot}"))?,
+        None => &creature.clips[0],
+    };
+
+    let decoded = mesh::parse(&archive.decompressed(clip.mesh.index as usize)?)?;
+    let stream = gpu::parse_stream(&decoded.commands)?;
+    let geometry = gpu::build_geometry(
+        &decoded,
+        stream.world_root_bone_count()?,
+        stream.gpu_commands()?,
+    )?;
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# ff-export: creature {creature_id}, clip {} ({})\n",
+        clip.slot,
+        manifest::clip_label(clip.slot)
+    ));
+    out.push_str(&format!(
+        "# {} vertices, {} faces, {} corners\n",
+        geometry.positions.len(),
+        geometry.face_count(),
+        geometry.corner_count()
+    ));
+
+    for position in &geometry.positions {
+        out.push_str(&format!("v {} {} {}\n", position[0], position[1], position[2]));
+    }
+    for uv in &geometry.uvs {
+        out.push_str(&format!("vt {} {}\n", uv[0], uv[1]));
+    }
+
+    let mut triangles = 0usize;
+    for group in &geometry.groups {
+        let key = match group.palette_base {
+            Some(value) => value.to_string(),
+            None => "none".to_string(),
+        };
+        out.push_str(&format!("g material_{key}\n"));
+        for polygon in &group.polygons {
+            for index in 1..polygon.len().saturating_sub(1) {
+                let fan = [&polygon[0], &polygon[index], &polygon[index + 1]];
+                let mut line = String::from("f");
+                for corner in fan {
+                    match corner.uv {
+                        Some(uv) => line.push_str(&format!(" {}/{}", corner.vertex + 1, uv + 1)),
+                        None => line.push_str(&format!(" {}", corner.vertex + 1)),
+                    }
+                }
+                out.push_str(&line);
+                out.push('\n');
+                triangles += 1;
+            }
+        }
+    }
+
+    std::fs::write(&output, out).with_context(|| format!("writing {}", output.display()))?;
+    println!(
+        "creature {creature_id}, clip {} ({}) -> {} triangles written to {}",
+        clip.slot,
+        manifest::clip_label(clip.slot),
+        triangles,
+        output.display()
+    );
 
     Ok(())
 }

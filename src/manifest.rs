@@ -72,6 +72,24 @@ impl Manifest {
     }
 }
 
+/// What each clip slot is, established by comparing the exported clips against in-game footage.
+///
+/// Slot 1 is the full attack animation; the game truncates it at run time to present a one, two or
+/// three hit attack, so what we export is the complete animation. Slot 2 is rare - only 36 of the
+/// 116 creatures have it - and has not been identified.
+pub fn clip_label(slot: usize) -> &'static str {
+    match slot {
+        1 => "attack",
+        2 => "unknown",
+        3 => "roar",
+        4 => "victory",
+        5 => "hit",
+        6 => "critical-hit",
+        7 => "idle",
+        _ => "unused",
+    }
+}
+
 /// Reads a NUL-terminated name at `offset`.
 fn name_at(data: &[u8], offset: usize) -> Result<String> {
     if offset >= data.len() {

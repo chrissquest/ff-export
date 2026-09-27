@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use ff_export::{manifest, mar, names, nds};
+use ff_export::{gpu, manifest, mar, mesh, names, nds};
 
 const ROM: &str = "externals/Fossil Fighters (USA).nds";
 const MANIFEST_JSON: &str = "externals/knowledge/arcdin.3cl.json";
@@ -201,4 +201,116 @@ fn m2_manifest_matches_the_reference_json() {
             assert_eq!(clip.texture.table_name, "arcdin");
         }
     }
+}
+
+/// Decodes one mesh entry into its geometry.
+fn decode(archive: &mar::Archive<'_>, mesh_index: u32) -> (mesh::Mesh, gpu::Geometry) {
+    let data = archive
+        .decompressed(mesh_index as usize)
+        .unwrap_or_else(|error| panic!("mesh entry {mesh_index} failed to decompress: {error:#}"));
+    let decoded = mesh::parse(&data)
+        .unwrap_or_else(|error| panic!("mesh entry {mesh_index} failed to parse: {error:#}"));
+    let stream = gpu::parse_stream(&decoded.commands)
+        .unwrap_or_else(|error| panic!("mesh entry {mesh_index} command stream failed: {error:#}"));
+    let geometry = gpu::build_geometry(
+        &decoded,
+        stream
+            .world_root_bone_count()
+            .unwrap_or_else(|error| panic!("mesh entry {mesh_index}: {error:#}")),
+        stream
+            .gpu_commands()
+            .unwrap_or_else(|error| panic!("mesh entry {mesh_index}: {error:#}")),
+    )
+    .unwrap_or_else(|error| panic!("mesh entry {mesh_index} geometry failed: {error:#}"));
+    (decoded, geometry)
+}
+
+#[test]
+fn m3_breme_matches_the_reference_numbers() {
+    let Some(rom) = rom() else { return };
+    let archive = arcdin(&rom);
+
+    // Breme's first clip: mesh 384, the numbers the reference export produced.
+    let (decoded, geometry) = decode(&archive, 384);
+
+    assert_eq!(decoded.scale, 32.0, "mesh scale");
+    assert_eq!(decoded.keyframe_count, 257, "authored frames");
+    assert_eq!(decoded.bones.len(), 21, "bone count");
+    assert_eq!(
+        decoded.bones[0].name, "waist",
+        "the bone table starts with the waist"
+    );
+    assert!(
+        decoded.bones.iter().all(|bone| bone.matrix.is_finite()),
+        "every bind matrix must be finite"
+    );
+
+    assert_eq!(geometry.positions.len(), 242, "unique vertices");
+    assert_eq!(geometry.face_count(), 391, "faces");
+    assert_eq!(geometry.triangle_count(), 408, "triangles");
+    assert_eq!(geometry.corner_count(), 1190, "polygon corners");
+    assert_eq!(geometry.groups.len(), 2, "material groups");
+
+    let (min, max) = geometry.bounds().expect("geometry has bounds");
+    let size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    for (axis, expected) in [(0, 4.001), (1, 9.041), (2, 10.328)] {
+        assert!(
+            (size[axis] - expected).abs() < 0.01,
+            "bound size on axis {axis} was {:.3}, expected {expected}",
+            size[axis]
+        );
+    }
+}
+
+#[test]
+fn m3_every_clip_of_every_creature_decodes() {
+    let Some(rom) = rom() else { return };
+    let archive = arcdin(&rom);
+    let parsed = manifest::parse(&archive.decompressed(0).unwrap()).unwrap();
+
+    let mut clips = 0usize;
+    for creature in &parsed.creatures {
+        for clip in &creature.clips {
+            let (decoded, geometry) = decode(&archive, clip.mesh.index);
+            let context = format!("creature {} clip {}", creature.id, clip.slot);
+
+            assert!(!decoded.bones.is_empty(), "{context}: no bones");
+            assert!(
+                decoded.bones.iter().all(|bone| bone.matrix.is_finite()),
+                "{context}: a bind matrix is not finite"
+            );
+            assert!(
+                geometry.positions.len() > 32,
+                "{context}: only {} vertices",
+                geometry.positions.len()
+            );
+            assert!(
+                geometry.triangle_count() > 32,
+                "{context}: only {} triangles",
+                geometry.triangle_count()
+            );
+            for group in &geometry.groups {
+                for polygon in &group.polygons {
+                    assert!(polygon.len() >= 3, "{context}: a polygon has {} corners", polygon.len());
+                    for corner in polygon {
+                        if let Some(uv) = corner.uv {
+                            assert!(
+                                uv < geometry.uvs.len(),
+                                "{context}: UV index {uv} is out of range"
+                            );
+                        }
+                        assert!(
+                            corner.vertex < geometry.positions.len(),
+                            "{context}: vertex index {} is out of range",
+                            corner.vertex
+                        );
+                    }
+                }
+            }
+
+            clips += 1;
+        }
+    }
+
+    assert_eq!(clips, 698, "the whole roster should decode");
 }

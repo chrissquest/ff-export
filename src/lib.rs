@@ -20,9 +20,13 @@
 
 pub mod bytes;
 pub mod codec;
+pub mod fixed;
+pub mod gpu;
 pub mod manifest;
 pub mod mar;
+pub mod matrix;
 pub mod mcm;
+pub mod mesh;
 pub mod names;
 pub mod nds;
 
