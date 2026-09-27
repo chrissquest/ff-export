@@ -18,6 +18,7 @@
 //! documentation, and from the format notes in `chris-wgpu/externals/knowledge`.
 //! No source code from other fan tools is copied here.
 
+pub mod anim;
 pub mod bytes;
 pub mod codec;
 pub mod fixed;

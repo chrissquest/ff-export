@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
-use ff_export::{gltf_out, gpu, manifest, mar, mcm, mesh, names, nds};
+use ff_export::{anim, gltf_out, gpu, manifest, mar, mcm, mesh, names, nds};
 
 const USAGE: &str = "\
 ff-export - Fossil Fighters (NDS) asset extraction
@@ -26,6 +26,7 @@ COMMANDS:
     mesh    <rom> <creature> [clip]     parse one creature mesh and report its geometry
     obj     <rom> <creature> [clip] <file.obj>   write the decoded mesh as Wavefront OBJ
     export  <rom> <creature> [clip] <file.glb>   write the bind-pose mesh and skeleton as .glb
+    anim    <rom> <creature> <clip>              inspect one clip's animation block
     hexdump <rom> <path> <entry> [len]  raw stored bytes of one entry, for analysis
     help                                show this text
 ";
@@ -44,6 +45,7 @@ fn main() -> ExitCode {
         Some("mesh") => cmd_mesh(&args[1..]),
         Some("obj") => cmd_obj(&args[1..]),
         Some("export") => cmd_export(&args[1..]),
+        Some("anim") => cmd_anim(&args[1..]),
         Some("help") | None | Some("-h") | Some("--help") => {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -677,6 +679,83 @@ fn cmd_export(args: &[String]) -> Result<()> {
         }
     );
     println!("wrote        : {} bytes to {}", bytes.len(), output.display());
+
+    Ok(())
+}
+
+/// Reports one clip's animation block, and compares its first frame with the mesh's bind pose.
+///
+/// The comparison answers a structural question: if frame 0 is the bind pose, the keyframes are in
+/// the same space as the bind matrices (all joints parented to the skeleton root), so they can drive
+/// glTF joint nodes directly.
+fn cmd_anim(args: &[String]) -> Result<()> {
+    let rom_path = arg(args, 0, "rom")?;
+    let creature_id: usize = arg(args, 1, "creature")?
+        .parse()
+        .context("creature id must be a number")?;
+    let clip_slot: usize = arg(args, 2, "clip")?
+        .parse()
+        .context("clip slot must be a number")?;
+
+    let rom = nds::Rom::open(&rom_path)?;
+    let (archive, _) = open_archive(&rom, "model/battle/arcdin")?;
+    let parsed = manifest::parse(&archive.decompressed(0)?)?;
+    let creature = parsed
+        .find(creature_id)
+        .with_context(|| format!("creature {creature_id} is not in the manifest"))?;
+    let clip = creature
+        .clips
+        .iter()
+        .find(|clip| clip.slot == clip_slot)
+        .with_context(|| format!("creature {creature_id} has no clip slot {clip_slot}"))?;
+
+    let animation = anim::parse(&archive.decompressed(clip.animation.index as usize)?)?;
+    let decoded = mesh::parse(&archive.decompressed(clip.mesh.index as usize)?)?;
+
+    println!("creature     : {creature_id}");
+    println!("clip         : {clip_slot} ({})", manifest::clip_label(clip_slot));
+    println!(
+        "animation    : {}:{}",
+        clip.animation.table_name, clip.animation.index
+    );
+    println!(
+        "bones        : {} (the mesh has {})",
+        animation.bone_count,
+        decoded.bones.len()
+    );
+    println!("frames       : {}", animation.frame_count);
+    println!(
+        "duration     : {:.3}s at 60 fps",
+        animation.frame_count as f64 / 60.0
+    );
+    println!("models       : {:?}", animation.included_models);
+
+    println!();
+    println!("bone          bind translation              frame 0 translation             delta");
+    for bone in 0..animation.bone_count.min(8) {
+        let Some(pose) = animation.transform(bone, 0) else {
+            continue;
+        };
+        let bind = &decoded.bones[bone].matrix;
+        let delta = [
+            pose.translation[0] - bind.translation[0],
+            pose.translation[1] - bind.translation[1],
+            pose.translation[2] - bind.translation[2],
+        ];
+        println!(
+            "{:<12} ({:7.3},{:7.3},{:7.3})  ({:7.3},{:7.3},{:7.3})  ({:6.3},{:6.3},{:6.3})",
+            decoded.bones[bone].name,
+            bind.translation[0],
+            bind.translation[1],
+            bind.translation[2],
+            pose.translation[0],
+            pose.translation[1],
+            pose.translation[2],
+            delta[0],
+            delta[1],
+            delta[2]
+        );
+    }
 
     Ok(())
 }

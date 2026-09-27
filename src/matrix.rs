@@ -148,6 +148,125 @@ impl Matrix4x3 {
     }
 }
 
+/// A transform split into the form glTF animates: translation, rotation, scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Transform {
+    pub translation: Vec3,
+    /// Quaternion as `(x, y, z, w)`.
+    pub rotation: [f64; 4],
+    pub scale: Vec3,
+}
+
+fn length(v: Vec3) -> f64 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
+fn scale_vector(v: Vec3, factor: f64) -> Vec3 {
+    [v[0] * factor, v[1] * factor, v[2] * factor]
+}
+
+fn cross_product(a: Vec3, b: Vec3) -> Vec3 {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn dot_product(a: Vec3, b: Vec3) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// Quaternion of a pure rotation given as three orthonormal columns.
+///
+/// Uses the largest-diagonal branch, which is numerically stable; the plain trace formula divides by
+/// a quantity that goes to zero as the rotation approaches 180 degrees.
+fn quaternion_from_columns(x: Vec3, y: Vec3, z: Vec3) -> [f64; 4] {
+    // the vectors are columns, so these are the matrix rows
+    let (m00, m10, m20) = (x[0], x[1], x[2]);
+    let (m01, m11, m21) = (y[0], y[1], y[2]);
+    let (m02, m12, m22) = (z[0], z[1], z[2]);
+    let trace = m00 + m11 + m22;
+
+    if trace > 0.0 {
+        let s = (trace + 1.0).sqrt() * 2.0;
+        [(m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25 * s]
+    } else if m00 > m11 && m00 > m22 {
+        let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0;
+        [0.25 * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s]
+    } else if m11 > m22 {
+        let s = (1.0 + m11 - m00 - m22).sqrt() * 2.0;
+        [(m01 + m10) / s, 0.25 * s, (m12 + m21) / s, (m02 - m20) / s]
+    } else {
+        let s = (1.0 + m22 - m00 - m11).sqrt() * 2.0;
+        [(m02 + m20) / s, (m12 + m21) / s, 0.25 * s, (m10 - m01) / s]
+    }
+}
+
+impl Matrix4x3 {
+    /// Splits the transform into translation, rotation and scale - what glTF animates.
+    ///
+    /// The basis vectors are the columns of a rotation, each scaled by one factor, so their lengths
+    /// are the scale and normalising them leaves a pure rotation. A negative determinant means the
+    /// basis is mirrored, so the x scale is negated and its column flipped to keep the quaternion a
+    /// proper rotation.
+    ///
+    /// Normalising first is the whole point. The reference extracts the quaternion from the raw,
+    /// still-scaled matrix, where the trace is not the rotation's trace - that is where its `-nan`
+    /// rotations came from.
+    pub fn decompose(&self) -> Transform {
+        let mut scale = [length(self.x), length(self.y), length(self.z)];
+
+        let normalized = |v: Vec3, len: f64, fallback: Vec3| {
+            if len > 1e-12 {
+                scale_vector(v, 1.0 / len)
+            } else {
+                fallback
+            }
+        };
+
+        let mut x = normalized(self.x, scale[0], [1.0, 0.0, 0.0]);
+        let y = normalized(self.y, scale[1], [0.0, 1.0, 0.0]);
+        let z = normalized(self.z, scale[2], [0.0, 0.0, 1.0]);
+
+        if dot_product(cross_product(x, y), z) < 0.0 {
+            x = scale_vector(x, -1.0);
+            scale[0] = -scale[0];
+        }
+
+        Transform {
+            translation: self.translation,
+            rotation: quaternion_from_columns(x, y, z),
+            scale,
+        }
+    }
+
+    /// Builds a transform from translation, rotation (quaternion `x, y, z, w`) and scale.
+    ///
+    /// This is the inverse of [`Matrix4x3::decompose`], and exists so the two can be tested against
+    /// each other.
+    pub fn from_trs(translation: Vec3, rotation: [f64; 4], scale: Vec3) -> Self {
+        let [x, y, z, w] = rotation;
+        let (x2, y2, z2) = (x + x, y + y, z + z);
+        let (xx, xy, xz) = (x * x2, x * y2, x * z2);
+        let (yy, yz, zz) = (y * y2, y * z2, z * z2);
+        let (wx, wy, wz) = (w * x2, w * y2, w * z2);
+
+        let rotation = [
+            [1.0 - (yy + zz), xy + wz, xz - wy],
+            [xy - wz, 1.0 - (xx + zz), yz + wx],
+            [xz + wy, yz - wx, 1.0 - (xx + yy)],
+        ];
+
+        Self {
+            x: scale_vector(rotation[0], scale[0]),
+            y: scale_vector(rotation[1], scale[1]),
+            z: scale_vector(rotation[2], scale[2]),
+            translation,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +333,60 @@ mod tests {
         degenerate.y = [0.0, 0.0, 0.0];
         degenerate.z = [0.0, 0.0, 0.0];
         assert!(degenerate.inverse().is_none());
+    }
+
+    #[test]
+    fn decompose_and_build_agree() {
+        let translation = [10.0, -3.0, 0.25];
+        let scale = [2.0, 1.0, 0.5];
+        let half_angle = std::f64::consts::FRAC_PI_4;
+        let rotation = [0.0, 0.0, half_angle.sin(), half_angle.cos()]; // 90 degrees about z
+
+        let matrix = Matrix4x3::from_trs(translation, rotation, scale);
+        let split = matrix.decompose();
+
+        for axis in 0..3 {
+            assert!((split.translation[axis] - translation[axis]).abs() < 1e-9);
+            assert!((split.scale[axis] - scale[axis]).abs() < 1e-9);
+        }
+
+        // quaternions are only defined up to sign, so compare the rebuilt transform instead
+        let rebuilt = Matrix4x3::from_trs(split.translation, split.rotation, split.scale);
+        for point in [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0], [-4.0, 0.5, 7.0]] {
+            let a = matrix.transform(point);
+            let b = rebuilt.transform(point);
+            for axis in 0..3 {
+                assert!((a[axis] - b[axis]).abs() < 1e-9, "axis {axis}: {a:?} vs {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn decompose_handles_a_mirrored_basis() {
+        // a negative determinant: x is negated
+        let matrix = Matrix4x3::from_trs([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], [-1.0, 1.0, 1.0]);
+        let split = matrix.decompose();
+        assert!(split.rotation.iter().all(|value| value.is_finite()));
+
+        let rebuilt = Matrix4x3::from_trs(split.translation, split.rotation, split.scale);
+        let point = [1.0, 2.0, 3.0];
+        let a = matrix.transform(point);
+        let b = rebuilt.transform(point);
+        for axis in 0..3 {
+            assert!((a[axis] - b[axis]).abs() < 1e-9, "axis {axis}: {a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn decompose_never_produces_non_finite_values() {
+        // the shape that broke the reference: scaled, and not orthonormal
+        let values = [2.0, 0.0, 0.0, 0.5, 1.0, 0.0, 0.0, 0.25, 3.0, 10.0, -4.0, 2.0];
+        let split = Matrix4x3::from_values(&values).decompose();
+        assert!(
+            split.rotation.iter().all(|value| value.is_finite()),
+            "rotation {:?}",
+            split.rotation
+        );
+        assert!(split.scale.iter().all(|value| value.is_finite()));
     }
 }

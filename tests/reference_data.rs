@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use ff_export::{gltf_out, gpu, manifest, mar, mesh, names, nds};
+use ff_export::{anim, gltf_out, gpu, manifest, mar, mesh, names, nds};
 
 const ROM: &str = "externals/Fossil Fighters (USA).nds";
 const MANIFEST_JSON: &str = "externals/knowledge/arcdin.3cl.json";
@@ -419,4 +419,67 @@ fn m3_every_creature_exports_a_glb() {
     }
 
     assert_eq!(exported, 116, "every creature should export");
+}
+
+#[test]
+fn m4_animation_frame_counts_match_the_reference() {
+    let Some(rom) = rom() else { return };
+    let archive = arcdin(&rom);
+    let parsed = manifest::parse(&archive.decompressed(0).unwrap()).unwrap();
+    let breme = parsed.find(30).expect("Breme is creature 30");
+
+    // the frame counts the reference export produced, per clip slot
+    for (slot, frames) in [(1, 257), (3, 90), (4, 200), (5, 80), (6, 80), (7, 60)] {
+        let clip = breme
+            .clips
+            .iter()
+            .find(|clip| clip.slot == slot)
+            .unwrap_or_else(|| panic!("Breme should have clip slot {slot}"));
+        let animation =
+            anim::parse(&archive.decompressed(clip.animation.index as usize).unwrap())
+                .unwrap_or_else(|error| panic!("clip {slot} failed to parse: {error:#}"));
+
+        assert_eq!(animation.frame_count, frames, "clip {slot} frame count");
+        assert_eq!(animation.bone_count, 21, "clip {slot} bone count");
+        assert_eq!(
+            animation.transforms.len(),
+            frames * 21,
+            "clip {slot} keyframe count"
+        );
+    }
+}
+
+#[test]
+fn m4_frame_zero_is_the_bind_pose() {
+    // The keyframes are in the same space as the bind matrices, which is what lets them drive glTF
+    // joint nodes directly with no bind-pose composition.
+    let Some(rom) = rom() else { return };
+    let archive = arcdin(&rom);
+    let parsed = manifest::parse(&archive.decompressed(0).unwrap()).unwrap();
+    let clip = parsed
+        .find(30)
+        .expect("Breme")
+        .clips
+        .iter()
+        .find(|clip| clip.slot == 7)
+        .expect("the idle clip");
+
+    let (decoded, _) = decode(&archive, clip.mesh.index);
+    let animation = anim::parse(&archive.decompressed(clip.animation.index as usize).unwrap())
+        .expect("the idle animation should parse");
+
+    assert_eq!(animation.bone_count, decoded.bones.len());
+    for bone in 0..animation.bone_count {
+        let pose = animation.transform(bone, 0).expect("frame 0");
+        let bind = &decoded.bones[bone].matrix;
+        for axis in 0..3 {
+            assert!(
+                (pose.translation[axis] - bind.translation[axis]).abs() < 1e-9,
+                "bone {bone} (`{}`) axis {axis}: frame 0 translation {} differs from the bind pose {}",
+                decoded.bones[bone].name,
+                pose.translation[axis],
+                bind.translation[axis]
+            );
+        }
+    }
 }
