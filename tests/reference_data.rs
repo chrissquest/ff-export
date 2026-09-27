@@ -315,6 +315,109 @@ fn m3_every_clip_of_every_creature_decodes() {
     assert_eq!(clips, 698, "the whole roster should decode");
 }
 
+/// Extracts the JSON chunk from a `.glb`.
+fn glb_json(bytes: &[u8]) -> serde_json::Value {
+    assert_eq!(&bytes[0..4], b"glTF", "glb magic");
+    let json_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    assert_eq!(&bytes[16..20], b"JSON", "the first chunk should be JSON");
+    serde_json::from_slice(&bytes[20..20 + json_length]).expect("the json chunk should parse")
+}
+
+/// Checks the spec rules the Khronos validator flagged, so they cannot silently come back.
+///
+/// The validator is the authority, but it is an external tool; this runs on every `cargo test`.
+fn check_gltf_rules(glb: &[u8], context: &str) {
+    let json = glb_json(glb);
+    // a missing array counts as empty: a bind-pose export has no animations
+    let array = |key: &str| -> Vec<serde_json::Value> {
+        json.get(key)
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let nodes = array("nodes");
+    let accessors = array("accessors");
+
+    // who is whose parent, from every node's children list
+    let mut parents: Vec<Option<usize>> = vec![None; nodes.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        if let Some(children) = node.get("children").and_then(|value| value.as_array()) {
+            for child in children {
+                parents[child.as_u64().unwrap() as usize] = Some(index);
+            }
+        }
+    }
+    let top = |mut node: usize| {
+        while let Some(parent) = parents[node] {
+            node = parent;
+        }
+        node
+    };
+
+    for (index, animation) in array("animations").iter().enumerate() {
+        // glTF forbids animating a node that carries a matrix
+        for channel in animation["channels"].as_array().expect("channels") {
+            let node = channel["target"]["node"].as_u64().expect("target node") as usize;
+            assert!(
+                nodes[node].get("matrix").is_none(),
+                "{context}: animation {index} targets node {node}, which has a matrix"
+            );
+        }
+
+        // every sampler input must declare bounds
+        for sampler in animation["samplers"].as_array().expect("samplers") {
+            let input = sampler["input"].as_u64().expect("input") as usize;
+            assert!(
+                accessors[input].get("min").is_some() && accessors[input].get("max").is_some(),
+                "{context}: animation {index} input accessor {input} has no bounds"
+            );
+        }
+    }
+
+    // min and max must be arrays as long as the accessor's component count
+    for (index, accessor) in accessors.iter().enumerate() {
+        let components = match accessor["type"].as_str().expect("type") {
+            "SCALAR" => 1usize,
+            "VEC2" => 2,
+            "VEC3" => 3,
+            "VEC4" => 4,
+            "MAT4" => 16,
+            other => panic!("{context}: accessor {index} has type {other}"),
+        };
+        for key in ["min", "max"] {
+            if let Some(value) = accessor.get(key) {
+                let array = value
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{context}: accessor {index} {key} is not an array"));
+                assert_eq!(
+                    array.len(),
+                    components,
+                    "{context}: accessor {index} {key} should have {components} values"
+                );
+            }
+        }
+    }
+
+    // a skin's joints must have a common root
+    for (index, skin) in array("skins").iter().enumerate() {
+        let joints: Vec<usize> = skin["joints"]
+            .as_array()
+            .expect("joints")
+            .iter()
+            .map(|value| value.as_u64().unwrap() as usize)
+            .collect();
+        assert!(!joints.is_empty(), "{context}: skin {index} has no joints");
+        let first = top(joints[0]);
+        for joint in &joints {
+            assert_eq!(
+                top(*joint),
+                first,
+                "{context}: skin {index} joints do not share a root"
+            );
+        }
+    }
+}
+
 #[test]
 fn m3_exported_glb_reads_back() {
     let Some(rom) = rom() else { return };
@@ -325,6 +428,7 @@ fn m3_exported_glb_reads_back() {
     // The crate's own reader has to accept what we wrote - that is the spec check.
     let (document, buffers, _images) =
         gltf::import_slice(&bytes).expect("the exported glb should import");
+    check_gltf_rules(&bytes, "Breme bind pose");
 
     let mesh = document.meshes().next().expect("one mesh");
     let primitives: Vec<_> = mesh.primitives().collect();
@@ -403,6 +507,7 @@ fn m3_every_creature_exports_a_glb() {
 
         let (document, _buffers, _images) = gltf::import_slice(&bytes)
             .unwrap_or_else(|error| panic!("creature {} does not import: {error:?}", creature.id));
+        check_gltf_rules(&bytes, &format!("creature {}", creature.id));
 
         let skin = document
             .skins()
@@ -519,6 +624,7 @@ fn m4_all_of_a_creatures_clips_land_in_one_glb() {
         gltf_out::build(&decoded, &geometry, "Breme", &clips).expect("the glb should build");
     let (document, buffers, _images) =
         gltf::import_slice(&bytes).expect("the exported glb should import");
+    check_gltf_rules(&bytes, "Breme with clips");
 
     let found: Vec<_> = document.animations().collect();
     assert_eq!(found.len(), 6, "Breme has six clips");

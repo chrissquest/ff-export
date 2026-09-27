@@ -234,9 +234,26 @@ impl Matrix4x3 {
             scale[0] = -scale[0];
         }
 
+        // A source matrix with any shear in it does not decompose into a rotation at all, so the
+        // quaternion comes out slightly short (the validator flagged lengths around 0.98). glTF
+        // requires unit quaternions, and TRS cannot express shear anyway, so normalise.
+        let mut rotation = quaternion_from_columns(x, y, z);
+        let norm = (rotation[0] * rotation[0]
+            + rotation[1] * rotation[1]
+            + rotation[2] * rotation[2]
+            + rotation[3] * rotation[3])
+            .sqrt();
+        if norm > 1e-12 {
+            for component in &mut rotation {
+                *component /= norm;
+            }
+        } else {
+            rotation = [0.0, 0.0, 0.0, 1.0];
+        }
+
         Transform {
             translation: self.translation,
-            rotation: quaternion_from_columns(x, y, z),
+            rotation,
             scale,
         }
     }
@@ -388,5 +405,29 @@ mod tests {
             split.rotation
         );
         assert!(split.scale.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn decompose_always_returns_a_unit_quaternion() {
+        // glTF requires unit quaternions, and the validator checks - a sheared matrix decomposes to a
+        // short one unless it is normalised.
+        let cases: [[f64; 12]; 3] = [
+            [2.0, 0.0, 0.0, 0.5, 1.0, 0.0, 0.0, 0.25, 3.0, 10.0, -4.0, 2.0],
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, -3.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 1.5, 1.0, 2.0, 3.0],
+        ];
+
+        for values in cases {
+            let rotation = Matrix4x3::from_values(&values).decompose().rotation;
+            let length = (rotation[0] * rotation[0]
+                + rotation[1] * rotation[1]
+                + rotation[2] * rotation[2]
+                + rotation[3] * rotation[3])
+                .sqrt();
+            assert!(
+                (length - 1.0).abs() < 1e-12,
+                "quaternion length was {length} for {values:?}"
+            );
+        }
     }
 }

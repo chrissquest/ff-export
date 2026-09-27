@@ -263,6 +263,17 @@ fn accessor(
     })
 }
 
+/// Points an accessor's buffer view at the binding target glTF asks for on vertex and index data.
+fn set_view_target(
+    root: &mut json::Root,
+    accessor: Index<json::Accessor>,
+    target: json::buffer::Target,
+) {
+    if let Some(view) = root.accessors[accessor.value()].buffer_view {
+        root.buffer_views[view.value()].target = Some(Valid(target));
+    }
+}
+
 /// The axis-aligned bounds of a vertex list, as JSON numbers for the accessor.
 fn position_bounds(positions: &[[f32; 3]]) -> (json::Value, json::Value) {
     let mut min = [f32::MAX; 3];
@@ -301,6 +312,14 @@ fn bytes_f32(values: &[f32]) -> Vec<u8> {
     out
 }
 
+fn vec3(v: [f64; 3]) -> [f32; 3] {
+    [v[0] as f32, v[1] as f32, v[2] as f32]
+}
+
+fn vec4(v: [f64; 4]) -> [f32; 4] {
+    [v[0] as f32, v[1] as f32, v[2] as f32, v[3] as f32]
+}
+
 /// Builds a `.glb` holding the creature's bind-pose mesh, its skeleton, and any clips given.
 ///
 /// Returns the file bytes and the split that produced them, so the caller can report what was
@@ -319,12 +338,6 @@ pub fn build(
     if split.positions.is_empty() || split.groups.iter().all(|group| group.is_empty()) {
         bail!("nothing to export: the geometry has no triangles");
     }
-
-    let bind: Vec<[f32; 16]> = decoded
-        .bones
-        .iter()
-        .map(|bone| bone.matrix.to_gltf_matrix())
-        .collect();
 
     let mut inverse_bind: Vec<[f32; 16]> = Vec::with_capacity(decoded.bones.len());
     for bone in &decoded.bones {
@@ -535,20 +548,48 @@ pub fn build(
         weights: None,
     });
 
-    // The skeleton is flat: every joint is a child of the scene carrying its bind transform, which
-    // is also how the reference models it.
+    // glTF wants a target on the buffer views used for vertex and index data.
+    let mesh_index = mesh.value();
+    let mut vertex_accessors: Vec<Index<json::Accessor>> = Vec::new();
+    let mut index_accessors: Vec<Index<json::Accessor>> = Vec::new();
+    for primitive in &root.meshes[mesh_index].primitives {
+        vertex_accessors.extend(primitive.attributes.values().copied());
+        if let Some(indices) = primitive.indices {
+            index_accessors.push(indices);
+        }
+    }
+    for accessor in vertex_accessors {
+        set_view_target(&mut root, accessor, json::buffer::Target::ArrayBuffer);
+    }
+    for accessor in index_accessors {
+        set_view_target(&mut root, accessor, json::buffer::Target::ElementArrayBuffer);
+    }
+
+    // A single node above the joints so that they have a common root, which glTF requires of a skin.
+    let skeleton_root = root.push(json::Node {
+        name: Some(format!("{name}_skeleton")),
+        ..Default::default()
+    });
+
+    // The skeleton is flat - every joint is a direct child of that root - which is how the reference
+    // models it too. The bind pose is written as TRS rather than as a matrix, because glTF forbids
+    // animating a node that carries a matrix, and these are exactly the values the channels write.
     let joint_nodes: Vec<Index<json::Node>> = decoded
         .bones
         .iter()
-        .zip(bind.iter())
-        .map(|(bone, matrix)| {
+        .map(|bone| {
+            let pose = bone.matrix.decompose();
             root.push(json::Node {
                 name: Some(bone.name.clone()),
-                matrix: Some(*matrix),
+                translation: Some(vec3(pose.translation)),
+                rotation: Some(json::scene::UnitQuaternion(vec4(pose.rotation))),
+                scale: Some(vec3(pose.scale)),
                 ..Default::default()
             })
         })
         .collect();
+
+    root.nodes[skeleton_root.value()].children = Some(joint_nodes.clone());
 
     // One glTF animation per clip: a sampler and a channel for each of a bone's three paths. Every
     // sampler in a clip shares the same time accessor.
@@ -565,7 +606,11 @@ pub fn build(
             chunks.frames,
             json::accessor::ComponentType::F32,
             json::accessor::Type::Scalar,
-            Some((json::Value::from(0.0), json::Value::from(last_time))),
+            // a SCALAR accessor's bounds have to be one-element arrays
+            Some((
+                json::Value::from(vec![0.0f32]),
+                json::Value::from(vec![last_time]),
+            )),
         );
 
         let mut samplers = Vec::new();
@@ -636,7 +681,7 @@ pub fn build(
     let skin = root.push(json::Skin {
         inverse_bind_matrices: Some(inverse_bind_accessor),
         joints: joint_nodes.clone(),
-        skeleton: None,
+        skeleton: Some(skeleton_root),
         name: Some(format!("{name}_skeleton")),
         extensions: Default::default(),
         extras: Default::default(),
@@ -649,8 +694,8 @@ pub fn build(
         ..Default::default()
     });
 
-    let mut scene_nodes = vec![mesh_node];
-    scene_nodes.extend(joint_nodes);
+    // the skeleton root carries the joints, so the scene needs only the mesh and that root
+    let scene_nodes = vec![mesh_node, skeleton_root];
     let scene = root.push(json::Scene {
         nodes: scene_nodes,
         name: Some("scene".to_string()),
